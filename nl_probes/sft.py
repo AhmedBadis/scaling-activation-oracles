@@ -1072,6 +1072,34 @@ if __name__ == "__main__":
     torch.cuda.set_device(local_rank)
     world_size = dist.get_world_size()
 
+    # Parse command line args for model overrides
+    import sys
+    oracle_model_name = None
+    target_model_name = None
+    
+    # Simple CLI parsing for model overrides
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg.startswith("--oracle_model_name="):
+            oracle_model_name = arg.split("=", 1)[1]
+        elif arg.startswith("--target_model_name="):
+            target_model_name = arg.split("=", 1)[1]
+    
+    # Load config with potential CLI overrides
+    cfg = SelfInterpTrainingConfig()
+    if oracle_model_name is not None:
+        cfg.oracle_model_name = oracle_model_name
+    if target_model_name is not None:
+        cfg.target_model_name = target_model_name
+    
+    # Sanity check
+    if local_rank == 0:
+        print(f"Oracle model: {cfg.oracle_model_name}")
+        print(f"Target model: {cfg.target_model_name}")
+        assert cfg.oracle_model_name, "Oracle model name must be set"
+        assert cfg.target_model_name, "Target model name must be set"
+        if cfg.oracle_model_name == cfg.target_model_name:
+            print("Warning: Oracle and target models are the same")
+
     main_train_size = 6000
     main_test_size = 250
     classification_datasets = {
@@ -1121,146 +1149,131 @@ if __name__ == "__main__":
         "singular_plural": {"num_train": 0, "num_test": main_test_size, "splits": ["test"]},
     }
 
+    # Use oracle model for dataset preprocessing
+    oracle_model_name = cfg.oracle_model_name
+    print(f"Using oracle model for dataset preprocessing: {oracle_model_name}")
+    
+    # Set up oracle model for dataset preprocessing
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{local_rank}")
 
     hook_layer = 1
-    # model_name = "Qwen/Qwen3-32B"
-    # model_name = "meta-llama/Llama-3.3-70B-Instruct"
-    # model_name = "google/gemma-2-9b-it"
-    # model_name = "Qwen/Qwen3-8B"
+    
+    # Process datasets using oracle model
+    model_name_str = oracle_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    models = [
-        # "Qwen/Qwen3-14B",
-        # "google/gemma-2-27b-it",
-        # "meta-llama/Llama-3.1-8B-Instruct",
-        # "google/gemma-3-4b-it",
-        # "google/gemma-3-12b-it",
-        # "google/gemma-3-27b-it",
-        "Qwen/Qwen3-4B",
-    ]
+    train_batch_size = 16
+    gradient_checkpointing = True
+    model_kwargs = {"attn_implementation": "sdpa"}
 
-    for model_name in models:
-        hf_repo_name = "N/A"
-
-        model_name_str = model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
-
-        train_batch_size = 16
-        gradient_checkpointing = True
-        model_kwargs = {"attn_implementation": "sdpa"}
-
-        if model_name == "Qwen/Qwen3-32B" or model_name == "meta-llama/Llama-3.3-70B-Instruct":
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_8bit_compute_dtype=dtype,
-            )
-            model_kwargs = {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
-
-        # if model_name == "meta-llama/Llama-3.3-70B-Instruct":
-        # train_batch_size = train_batch_size * 4  # increase gpu utilization on 4x GPUs
-        # cuts training time by ~50%
+    if oracle_model_name == "Qwen/Qwen3-32B" or oracle_model_name == "meta-llama/Llama-3.3-70B-Instruct":
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            bnb_8bit_compute_dtype=dtype,
+        )
+        model_kwargs = {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
 
         print("Global train batch size:", train_batch_size)
-        assert train_batch_size % world_size == 0, (
-            f"Global batch size {train_batch_size} must be divisible by world_size {world_size}"
+    assert train_batch_size % world_size == 0, (
+        f"Global batch size {train_batch_size} must be divisible by world_size {world_size}"
+    )
+    train_batch_size = train_batch_size // world_size
+    print(f"Per-rank train batch size: {train_batch_size}, world size: {world_size}")
+
+    layer_percents = [25, 50, 75]
+    save_acts = False
+
+    gradient_accumulation_steps = 1
+
+    # Build loader groups using oracle model for dataset preprocessing
+    loader_groups = build_loader_groups(
+        model_name=oracle_model_name,  # Use oracle model for datasets
+        layer_percents=layer_percents,
+        act_collection_batch_size=train_batch_size,
+        save_acts=save_acts,
+        classification_datasets=classification_datasets,
+        model_kwargs=model_kwargs,
+    )
+
+    classification_dataset_loaders = loader_groups["classification_loaders"]
+    past_lens_loaders = loader_groups["past_lens_loaders"]
+    sae_dataset_loaders = loader_groups["sae_loaders"]
+    sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
+    latentqa_loaders = loader_groups["latentqa_loaders"]
+
+    iterations = [
+        # Default dataset mixture
+        # Set load_lora_path to checkpoint path to continue training
+        {
+            "load_lora_path": None,
+            "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
+            "wandb_suffix": f"_latentqa_cls_past_lens_oracle_{oracle_model_name.split('/')[-1]}_target_{cfg.target_model_name.split('/')[-1]}",
+        },
+        # {
+        #     "load_lora_path": None,
+        #     "dataset_loaders": latentqa_loaders,
+        #     "wandb_suffix": f"_latentqa_only_{model_name_str}",
+        # },
+    ]
+
+    for hyperparam_override in iterations:
+        loop_dataset_loaders = hyperparam_override.pop("dataset_loaders")
+        if hyperparam_override["load_lora_path"] is not None:
+            assert os.path.exists(hyperparam_override["load_lora_path"]), f"{hyperparam_override['load_lora_path']}"
+
+        # Update existing cfg with training parameters
+        cfg.hook_onto_layer = hook_layer
+        cfg.hf_repo_name = "N/A"  # Set to "N/A" for training
+        cfg.layer_percents = layer_percents
+        cfg.train_batch_size = train_batch_size
+        cfg.activation_collection_batch_size = train_batch_size * 4
+        cfg.eval_batch_size = train_batch_size * 8
+        cfg.eval_steps = 10_000
+        cfg.eval_on_start = True
+        cfg.gradient_checkpointing = gradient_checkpointing
+        cfg.gradient_accumulation_steps = gradient_accumulation_steps
+        cfg.save_steps = 10_000
+        
+        # Apply any hyperparameter overrides
+        for key, value in hyperparam_override.items():
+            setattr(cfg, key, value)
+
+        cfg.finalize(dataset_loaders=loop_dataset_loaders)
+
+        print(f"save dir: {cfg.save_dir}")
+
+        tokenizer = load_tokenizer(cfg.target_model_name)  # Use target model for training
+
+        # Ensure only rank 0 performs any on-disk dataset creation
+        if local_rank == 0:
+            _ensure_datasets_exist(loop_dataset_loaders)
+        dist.barrier()
+
+        all_training_data, all_eval_data = build_datasets(
+            cfg, dataset_loaders=loop_dataset_loaders, window_mult=cfg.window_mult
         )
-        train_batch_size = train_batch_size // world_size
-        print(f"Per-rank train batch size: {train_batch_size}, world size: {world_size}")
 
-        layer_percents = [25, 50, 75]
-        save_acts = False
+        # for debugging
+        # all_training_data = all_training_data[:100]
+        # eval_keys = list(all_eval_data.keys())
+        # assert len(eval_keys) == 1
+        # eval_key = eval_keys[0]
+        # all_eval_data = {eval_key: all_training_data[:]}
 
-        gradient_accumulation_steps = 1
+        print(f"training data length: {len(all_training_data)}, eval data length: {len(all_eval_data)}")
 
-        # Build loader groups (single + multi variants)
-        loader_groups = build_loader_groups(
-            model_name=model_name,
-            layer_percents=layer_percents,
-            act_collection_batch_size=train_batch_size,
-            save_acts=save_acts,
-            classification_datasets=classification_datasets,
+        print(asdict(cfg))
+
+        train_model(
+            cfg=cfg,
+            training_data=all_training_data,
+            eval_datasets=all_eval_data,
+            tokenizer=tokenizer,
+            dtype=dtype,
+            device=device,
             model_kwargs=model_kwargs,
+            verbose=True,
         )
-
-        classification_dataset_loaders = loader_groups["classification_loaders"]
-        past_lens_loaders = loader_groups["past_lens_loaders"]
-        sae_dataset_loaders = loader_groups["sae_loaders"]
-        sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
-        latentqa_loaders = loader_groups["latentqa_loaders"]
-
-        iterations = [
-            # Default dataset mixture
-            # Set load_lora_path to checkpoint path to continue training
-            {
-                "load_lora_path": None,
-                "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
-                "wandb_suffix": f"_latentqa_cls_past_lens_{model_name_str}",
-            },
-            # {
-            #     "load_lora_path": None,
-            #     "dataset_loaders": latentqa_loaders,
-            #     "wandb_suffix": f"_latentqa_only_{model_name_str}",
-            # },
-        ]
-
-        for hyperparam_override in iterations:
-            loop_dataset_loaders = hyperparam_override.pop("dataset_loaders")
-            if hyperparam_override["load_lora_path"] is not None:
-                assert os.path.exists(hyperparam_override["load_lora_path"]), f"{hyperparam_override['load_lora_path']}"
-
-            cfg = SelfInterpTrainingConfig(
-                model_name=model_name,
-                hook_onto_layer=hook_layer,
-                hf_repo_name=hf_repo_name,
-                # wandb_suffix=wandb_suffix,
-                layer_percents=layer_percents,
-                train_batch_size=train_batch_size,
-                activation_collection_batch_size=train_batch_size * 4,
-                eval_batch_size=train_batch_size * 8,
-                eval_steps=10_000,
-                eval_on_start=True,
-                gradient_checkpointing=gradient_checkpointing,
-                gradient_accumulation_steps=gradient_accumulation_steps,
-                save_steps=10_000,
-                **hyperparam_override,
-            )
-
-            cfg.finalize(dataset_loaders=loop_dataset_loaders)
-
-            print(f"save dir: {cfg.save_dir}")
-
-            tokenizer = load_tokenizer(cfg.model_name)
-
-            # Ensure only rank 0 performs any on-disk dataset creation
-            if local_rank == 0:
-                _ensure_datasets_exist(loop_dataset_loaders)
-            dist.barrier()
-
-            all_training_data, all_eval_data = build_datasets(
-                cfg, dataset_loaders=loop_dataset_loaders, window_mult=cfg.window_mult
-            )
-
-            # for debugging
-            # all_training_data = all_training_data[:100]
-            # eval_keys = list(all_eval_data.keys())
-            # assert len(eval_keys) == 1
-            # eval_key = eval_keys[0]
-            # all_eval_data = {eval_key: all_training_data[:]}
-
-            print(f"training data length: {len(all_training_data)}, eval data length: {len(all_eval_data)}")
-
-            print(asdict(cfg))
-
-            train_model(
-                cfg=cfg,
-                training_data=all_training_data,
-                eval_datasets=all_eval_data,
-                tokenizer=tokenizer,
-                dtype=dtype,
-                device=device,
-                model_kwargs=model_kwargs,
-                verbose=True,
-            )
 
     # Clean up DDP
     dist.destroy_process_group()

@@ -10,11 +10,27 @@ from nl_probes.utils.common import layer_percent_to_layer
 
 @dataclass
 class SelfInterpTrainingConfig:
-    # --- Model ---
-    model_name: str = "Qwen/Qwen3-8B"
+    # --- Models ---
+    oracle_model_name: str = "Qwen/Qwen3-1.7B"
+    target_model_name: str = "Qwen/Qwen3-4B"
     hook_onto_layer: int = 1
     layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
     act_layers: list[int] = field(default_factory=list)  # derived if empty
+    
+    # Backward compatibility
+    @property
+    def model_name(self) -> str:
+        """For backward compatibility - returns target model name"""
+        return self.target_model_name
+    
+    # Handle legacy single model_name for backward compatibility
+    def __post_init__(self):
+        # If only one model is set (legacy behavior), use it for both
+        if hasattr(self, '_original_model_name'):
+            # Legacy mode: single model_name was set
+            self.oracle_model_name = self._original_model_name
+            self.target_model_name = self._original_model_name
+            delattr(self, '_original_model_name')
 
     # --- Data / experiment ---
     dataset_configs: list[dict] = field(default_factory=list)
@@ -68,11 +84,11 @@ class SelfInterpTrainingConfig:
         self.dataset_configs = [asdict(dataset_loader.dataset_config) for dataset_loader in dataset_loaders]
         # act_layers from percents if caller did not set them directly
         if not self.act_layers:
-            self.act_layers = [layer_percent_to_layer(self.model_name, p) for p in self.layer_percents]
+            self.act_layers = [layer_percent_to_layer(self.target_model_name, p) for p in self.layer_percents]
 
         # run name - stable and readable
         layers_str = "-".join(map(str, self.act_layers))
-        default_run = f"{self.model_name}-layers_{layers_str}-decoder-{self.use_decoder_vectors}{self.wandb_suffix}"
+        default_run = f"{self.target_model_name}-layers_{layers_str}-decoder-{self.use_decoder_vectors}{self.wandb_suffix}"
         if not self.wandb_run_name:
             self.wandb_run_name = default_run
 
