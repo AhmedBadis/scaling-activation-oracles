@@ -1,7 +1,10 @@
+# GRADIENT ACCUMULATION FOR GOOD RESULTS OR RUN TILL END
+
 import os
 
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # Reduce warnings
 
 import random
 import json
@@ -105,7 +108,7 @@ if __name__ == "__main__":
     config = base_experiment.VerbalizerEvalConfig(
         model_name=model_name,
         activation_input_types=["lora"],
-        eval_batch_size=512,
+        eval_batch_size=8,  # Reduced from 512 to save memory
         verbalizer_generation_kwargs=generation_kwargs,
         full_seq_repeats=1,
         segment_repeats=1,
@@ -160,6 +163,14 @@ if __name__ == "__main__":
     print(f"Loading model: {model_name} on {device} with dtype={dtype}")
     model = load_model(model_name, dtype)
     model.eval()
+    
+    # Enable memory efficient attention if available
+    if hasattr(model.config, 'use_cache'):
+        model.config.use_cache = False  # Disable cache to save memory
+    
+    # Clear cache after loading
+    torch.cuda.empty_cache()
+    print(f"GPU memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     # Add dummy adapter so peft_config exists and we can use the consistent PeftModel API
     dummy_config = LoraConfig()
@@ -221,6 +232,9 @@ if __name__ == "__main__":
 
             if sanitized_target_name is not None and sanitized_target_name in model.peft_config:
                 model.delete_adapter(sanitized_target_name)
+            
+            # Clear GPU memory between iterations
+            torch.cuda.empty_cache()
 
             combo_pbar.update(1)
 

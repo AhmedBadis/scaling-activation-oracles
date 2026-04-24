@@ -144,8 +144,8 @@ def get_model_kwargs(model_name: str) -> dict:
             load_in_8bit=True,
             bnb_8bit_compute_dtype=torch.bfloat16,
         )
-        return {"quantization_config": bnb_config}
-    return {}
+        return {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
+    return {"attn_implementation": "sdpa"}
 
 
 def get_batch_size(model_name: str) -> int:

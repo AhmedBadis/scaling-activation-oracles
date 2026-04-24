@@ -304,26 +304,228 @@ def oom_preflight_check(
     print("OOM preflight check complete")
 
 
+
+
+
+
+import os
+import sys
+import tempfile
+import signal
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from torch.nn.utils import clip_grad_norm_
+from tqdm import tqdm
+
+# -------------------- Checkpoint helpers --------------------
+def _atomic_save(obj: dict, path: str):
+    """Save atomically to avoid partial files being picked up as checkpoints."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+    os.close(tmp_fd)
+    try:
+        torch.save(obj, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def find_latest_checkpoint(save_dir: str):
+    """Find the latest checkpoint by step or epoch. Returns path or None."""
+    p = Path(save_dir)
+    if not p.exists():
+        return None
+    step_ckpts = sorted(p.glob("checkpoint_step_*.pth"), key=lambda x: x.stat().st_mtime)
+    epoch_ckpts = sorted(p.glob("checkpoint_epoch_*.pth"), key=lambda x: x.stat().st_mtime)
+    if step_ckpts:
+        return str(step_ckpts[-1])
+    if epoch_ckpts:
+        return str(epoch_ckpts[-1])
+    return None
+
+from pickle import UnpicklingError
+
+def save_checkpoint(
+    save_dir: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    scheduler: Any | None,
+    global_step: int,
+    epoch: int,
+    rng_state: dict | None = None,
+    extra: dict | None = None,
+    tag: str = "step",
+):
+    """
+    Save a checkpoint (only rank 0 should write the file contents).
+    - tag: "step" or "epoch" used in filename.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    filename = f"checkpoint_{tag}_{global_step if tag == 'step' else epoch}.pth"
+    path = os.path.join(save_dir, filename)
+
+    ckpt = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+        "global_step": global_step,
+        "epoch": epoch,
+        "extra": extra or {},
+    }
+    if rng_state is not None:
+        ckpt["rng_state"] = rng_state
+
+    # Use atomic save helper if you have one; otherwise fallback to torch.save
+    try:
+        _atomic_save(ckpt, path)  # keep your existing atomic save if available
+    except NameError:
+        torch.save(ckpt, path)
+    return path
+
+
+def load_checkpoint_if_exists(save_dir: str, model: torch.nn.Module, optimizer=None, scheduler=None):
+    """
+    If a checkpoint exists in save_dir, load it and return (global_step, epoch).
+    Only call this after model/optimizer/scheduler are created and moved to device.
+
+    This function is robust to PyTorch 2.6+ behavior where torch.load defaults to
+    weights_only=True and to the "safe globals" restriction for some numpy objects.
+    """
+    ckpt_path = find_latest_checkpoint(save_dir)
+    if ckpt_path is None:
+        return None, None
+
+    # Try loading in a few ways to handle PyTorch 2.6+ weights_only default and
+    # the safe-globals restriction for numpy reconstruction.
+    ckpt = None
+    load_kwargs = {"map_location": "cpu"}
+
+    # First attempt: default torch.load (works on older PyTorch or if file is weights-only)
+    try:
+        ckpt = torch.load(ckpt_path, **load_kwargs)
+    except UnpicklingError:
+        # PyTorch 2.6+ may have attempted weights-only load and failed; retry allowing full unpickling.
+        try:
+            ckpt = torch.load(ckpt_path, **{**load_kwargs, "weights_only": False})
+        except TypeError:
+            # Older torch versions may not accept weights_only argument; re-raise original
+            raise
+    except Exception as e:
+        # If error mentions numpy.core.multiarray._reconstruct, try allowlisting that global
+        msg = str(e)
+        if "numpy.core.multiarray._reconstruct" in msg or "WeightsUnpickler error" in msg:
+            try:
+                import numpy as np
+                from torch.serialization import add_safe_globals
+
+                # Allowlist numpy's reconstruct function and retry with full unpickling.
+                add_safe_globals([np.core.multiarray._reconstruct])
+                ckpt = torch.load(ckpt_path, **{**load_kwargs, "weights_only": False})
+            except Exception:
+                # If that still fails, re-raise the original exception for visibility.
+                raise
+        else:
+            raise
+
+    if ckpt is None:
+        raise RuntimeError(f"Failed to load checkpoint from {ckpt_path}")
+
+    # Load model (allow missing keys if shapes differ; adjust strict as needed)
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+    # Load optimizer and scheduler if present
+    if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception:
+            # best-effort: ignore optimizer restore failures
+            pass
+    if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except Exception:
+            pass
+
+    # Restore RNG state if present
+    if "rng_state" in ckpt:
+        rng = ckpt["rng_state"]
+        if "torch" in rng:
+            torch.set_rng_state(rng["torch"])
+        if "cuda" in rng and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        if "python" in rng:
+            import random
+            random.setstate(rng["python"])
+        if "numpy" in rng:
+            import numpy as np
+            np.random.set_state(rng["numpy"])
+
+    return int(ckpt.get("global_step", 0)), int(ckpt.get("epoch", 0))
+
+
+def capture_rng_state():
+    """Capture RNG state for reproducibility in checkpoint."""
+    state = {"torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    try:
+        import random, numpy as np  # type: ignore
+
+        state["python"] = random.getstate()
+        state["numpy"] = np.random.get_state()
+    except Exception:
+        pass
+    return state
+
+
+
+# -------------------- length_grouped_reorder --------------------
+def length_grouped_reorder(
+    data: list["TrainingDataPoint"],
+    batch_size: int,
+    window_mult: int,
+) -> list["TrainingDataPoint"]:
+    """
+    Reorder data by grouping into mega-batches (window_mult * batch_size),
+    sorting within each mega-batch by length descending, and flattening.
+    This reduces padding waste while preserving some randomness across mega-batches.
+    """
+    lengths = [len(d.input_ids) for d in data]
+    indices = list(range(len(data)))
+    megabatch_size = window_mult * batch_size
+    megabatches = [indices[i : i + megabatch_size] for i in range(0, len(indices), megabatch_size)]
+    megabatches = [sorted(mb, key=lambda i: lengths[i], reverse=True) for mb in megabatches]
+    new_order = [i for mb in megabatches for i in mb]
+    return [data[i] for i in new_order]
+
+
+# -------------------- train_model with checkpointing --------------------
 def train_model(
-    cfg: SelfInterpTrainingConfig,
-    training_data: list[TrainingDataPoint],
-    eval_datasets: dict[str, list[TrainingDataPoint]],
-    tokenizer: PreTrainedTokenizer,
+    cfg: "SelfInterpTrainingConfig",
+    training_data: list["TrainingDataPoint"],
+    eval_datasets: dict[str, list["TrainingDataPoint"]],
+    tokenizer: "PreTrainedTokenizer",
     device: torch.device,
     dtype: torch.dtype,
     model_kwargs: dict[str, Any],
     verbose: bool = False,
 ):
-    # Distributed settings (always on; launch with torchrun, even on 1 GPU)
+    """
+    Training loop with:
+      - resume from latest checkpoint if present,
+      - checkpoint on update steps every cfg.save_steps,
+      - checkpoint on epoch boundaries every cfg.save_epoch_interval,
+      - signal handlers for SIGTERM and SIGUSR1 to trigger immediate checkpoint.
+    """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-    # Ensure loads happen on this GPU only (important for quantized models)
-    model_kwargs = {
-        **model_kwargs,
-        "device_map": {"": f"cuda:{local_rank}"},
-    }
+    model_kwargs = {**model_kwargs, "device_map": {"": f"cuda:{local_rank}"}}
 
     set_seed(cfg.seed)
     model = load_model(cfg.model_name, dtype, **model_kwargs)
@@ -340,7 +542,8 @@ def train_model(
         target_modules = cfg.lora_target_modules
         vlm_targets = get_text_only_lora_targets(cfg.model_name)
         if vlm_targets and target_modules == "all-linear":
-            print(f"VLM detected ({cfg.model_name}): excluding vision tower from LoRA")
+            if rank == 0:
+                print(f"VLM detected ({cfg.model_name}): excluding vision tower from LoRA")
             target_modules = vlm_targets
 
         lora_config = LoraConfig(
@@ -359,12 +562,10 @@ def train_model(
 
     model.print_trainable_parameters()
 
-    # Wrap with DDP for training, but keep the PEFT model reference for hooks/eval
     torch.cuda.set_device(local_rank)
     train_model_module: torch.nn.Module = torch.nn.parallel.DistributedDataParallel(
         model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
     )
-
     train_model_module.train()
 
     oom_preflight_check(cfg, training_data, model, submodule, tokenizer, device, dtype)
@@ -376,18 +577,19 @@ def train_model(
     global_step_size = cfg.train_batch_size * world_size
     effective_steps = (len(training_data) // global_step_size) * global_step_size
     if effective_steps != len(training_data):
-        print(f"Trimming training_data from {len(training_data)} to {effective_steps} for equal DDP steps")
+        if rank == 0:
+            print(f"Trimming training_data from {len(training_data)} to {effective_steps} for equal DDP steps")
         training_data = training_data[:effective_steps]
 
-    # Token accounting (approx): count tokens after the DDP trim and before sharding.
-    # This slightly overestimates actual training tokens because we later trim per-rank
-    # to align with gradient_accumulation_steps.
     if rank == 0:
         tokens_per_epoch_est = sum(len(dp.input_ids) for dp in training_data)
         total_training_tokens_est = tokens_per_epoch_est * cfg.num_epochs
         num_examples_pre_shard = len(training_data)
 
-    # Shard dataset per rank (simple strided split)
+    # Optionally reorder by length to reduce padding
+    if getattr(cfg, "length_grouping_window_mult", None):
+        training_data = length_grouped_reorder(training_data, cfg.train_batch_size, cfg.length_grouping_window_mult)
+
     training_data = training_data[rank::world_size]
 
     num_batches_per_epoch = len(training_data) // cfg.train_batch_size
@@ -409,9 +611,53 @@ def train_model(
         num_warmup_steps=warmup_steps,
         num_training_steps=total_training_steps,
     )
-    # --------------------------------------------------------------
 
+    # ---------------- checkpoint / resume ----------------
     global_step = 0
+    start_epoch = 0
+
+    ckpt_global_step, ckpt_epoch = load_checkpoint_if_exists(cfg.save_dir, model, optimizer=optimizer, scheduler=scheduler)
+    if ckpt_global_step is not None:
+        global_step = ckpt_global_step
+        start_epoch = ckpt_epoch
+        if rank == 0:
+            print(f"Resuming from checkpoint: global_step={global_step}, epoch={start_epoch}")
+
+    # Re-wrap with DDP to ensure correct device mapping after loading weights
+    train_model_module = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+    )
+    train_model_module.train()
+
+    # Signal handler to trigger immediate checkpointing
+    def _signal_handler(signum, frame):
+        try:
+            if rank == 0:
+                print(f"Signal {signum} received on rank {rank}: saving checkpoint (global_step={global_step}, epoch={start_epoch})")
+                rng = capture_rng_state()
+                save_checkpoint(
+                    cfg.save_dir,
+                    model,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    start_epoch,
+                    rng_state=rng,
+                    extra={"signal": signum},
+                    tag="step",
+                )
+            dist.barrier()
+        except Exception as e:
+            print(f"Exception in signal handler: {e}", file=sys.stderr)
+        if signum == signal.SIGTERM:
+            sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGUSR1, _signal_handler)
+    except Exception:
+        # Some environments (e.g., certain distributed launchers) may not allow signal registration
+        pass
 
     # Init Weights & Biases only on rank 0
     if rank == 0:
@@ -420,24 +666,44 @@ def train_model(
         wandb.summary["train/total_tokens_est"] = total_training_tokens_est
         wandb.summary["train/num_examples_pre_shard"] = num_examples_pre_shard
 
-    for epoch in range(cfg.num_epochs):
+    # If resuming, compute starting epoch and how many updates were done in that epoch
+    resumed_updates = global_step
+    if resumed_updates > 0:
+        start_epoch = resumed_updates // steps_per_epoch
+
+    for epoch in range(start_epoch, cfg.num_epochs):
         accumulated_loss = 0.0
         optimizer.zero_grad()
+
+        # Optionally save at epoch start (useful for periodic epoch checkpoints)
+        if getattr(cfg, "save_epoch_interval", None) and (epoch % cfg.save_epoch_interval == 0) and epoch != start_epoch:
+            if rank == 0:
+                rng = capture_rng_state()
+                save_checkpoint(cfg.save_dir, model, optimizer, scheduler, global_step, epoch, rng_state=rng, tag="epoch")
+            dist.barrier()
+
+        updates_done_in_epoch = 0
+        if epoch == start_epoch and resumed_updates > 0:
+            updates_done_in_epoch = resumed_updates % steps_per_epoch
+
+        batch_range = range(0, len(training_data), cfg.train_batch_size)
+        batches_to_skip = updates_done_in_epoch * cfg.gradient_accumulation_steps if updates_done_in_epoch > 0 else 0
+
         for step_idx, start in enumerate(
             tqdm(
-                range(0, len(training_data), cfg.train_batch_size),
+                batch_range,
                 desc=f"Training epoch {epoch + 1}",
                 disable=rank != 0,
             )
         ):
-            t_batch_list: list[TrainingDataPoint] = training_data[start : start + cfg.train_batch_size]
+            if step_idx < batches_to_skip:
+                continue
 
-            # Compute missing steering vectors using the PEFT model (not DDP wrapper)
+            t_batch_list: list["TrainingDataPoint"] = training_data[start : start + cfg.train_batch_size]
+
             t_batch_list = materialize_missing_steering_vectors(t_batch_list, tokenizer, model)
-
             t_batch = construct_batch(t_batch_list, tokenizer, device)
 
-            # Forward/backward on the DDP-wrapped module if enabled
             loss = train_features_batch(cfg, t_batch, train_model_module, submodule, device, dtype)
             loss = loss / cfg.gradient_accumulation_steps
             loss.backward()
@@ -462,43 +728,42 @@ def train_model(
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
-                # -------------------------------- evaluation --------------------------------
                 if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
                     dist.barrier()
 
-                if global_step % cfg.save_steps == 0 and global_step > 0:
+                # Checkpoint on update steps
+                if getattr(cfg, "save_steps", None) and (global_step % cfg.save_steps == 0) and global_step > 0:
                     if rank == 0:
-                        model.save_pretrained(f"{cfg.save_dir}/step_{global_step}")
-                        if cfg.hf_push_to_hub and cfg.hf_repo_id:
-                            print("Pushing LoRA adapter to Hugging Face Hub...")
-                            push_lora_to_hf(
-                                model=model,
-                                tokenizer=tokenizer,
-                                repo_id=cfg.hf_repo_id + f"-step-{global_step}",
-                                private=cfg.hf_private_repo,
-                                commit_message=(f"SAE introspection LoRA - {cfg.wandb_run_name} - step {global_step}"),
-                            )
-                            print("Pushed LoRA adapter to Hugging Face Hub.")
+                        rng = capture_rng_state()
+                        ckpt_path = save_checkpoint(cfg.save_dir, model, optimizer, scheduler, global_step, epoch, rng_state=rng, tag="step")
+                        if verbose:
+                            print(f"Saved checkpoint at {ckpt_path}")
                     dist.barrier()
 
                 global_step += 1
                 accumulated_loss = 0.0
 
-    print("Training complete.")
+        # End of epoch: optionally save an epoch checkpoint every cfg.save_epoch_interval epochs
+        if getattr(cfg, "save_epoch_interval", None) and ((epoch + 1) % cfg.save_epoch_interval == 0):
+            if rank == 0:
+                rng = capture_rng_state()
+                ckpt_path = save_checkpoint(cfg.save_dir, model, optimizer, scheduler, global_step, epoch + 1, rng_state=rng, tag="epoch")
+                if verbose:
+                    print(f"Saved epoch checkpoint at {ckpt_path}")
+            dist.barrier()
 
-    # Save final model
+    # Finalize
     if rank == 0:
+        print("Training complete.")
         print("Saving final model...")
         model.save_pretrained(f"{cfg.save_dir}/final")
 
-        # Final evaluation
         print("Running final evaluation...")
         eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
         wandb.finish()
 
-        # Push to Hugging Face if configured
         if cfg.hf_push_to_hub and cfg.hf_repo_id:
             print("Pushing LoRA adapter to Hugging Face Hub...")
             push_lora_to_hf(
@@ -511,23 +776,10 @@ def train_model(
     dist.barrier()
 
 
-def length_grouped_reorder(
-    data: list[TrainingDataPoint],
-    batch_size: int,
-    window_mult: int,
-) -> list[TrainingDataPoint]:
-    lengths = [len(d.input_ids) for d in data]
 
-    indices = list(range(len(data)))
-    megabatch_size = window_mult * batch_size
 
-    # Slice into mega-batches
-    megabatches = [indices[i : i + megabatch_size] for i in range(0, len(indices), megabatch_size)]
-    # Sort within each mega-batch by length desc
-    megabatches = [sorted(mb, key=lambda i: lengths[i], reverse=True) for mb in megabatches]
 
-    new_order = [i for mb in megabatches for i in mb]
-    return [data[i] for i in new_order]
+
 
 
 def build_datasets(
@@ -895,14 +1147,14 @@ if __name__ == "__main__":
 
         train_batch_size = 16
         gradient_checkpointing = True
-        model_kwargs = {}
+        model_kwargs = {"attn_implementation": "sdpa"}
 
         if model_name == "Qwen/Qwen3-32B" or model_name == "meta-llama/Llama-3.3-70B-Instruct":
             bnb_config = BitsAndBytesConfig(
                 load_in_8bit=True,
                 bnb_8bit_compute_dtype=dtype,
             )
-            model_kwargs = {"quantization_config": bnb_config}
+            model_kwargs = {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
 
         # if model_name == "meta-llama/Llama-3.3-70B-Instruct":
         # train_batch_size = train_batch_size * 4  # increase gpu utilization on 4x GPUs
@@ -969,6 +1221,7 @@ if __name__ == "__main__":
                 eval_on_start=True,
                 gradient_checkpointing=gradient_checkpointing,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                save_steps=10_000,
                 **hyperparam_override,
             )
 

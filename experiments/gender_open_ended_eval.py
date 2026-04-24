@@ -130,7 +130,7 @@ if __name__ == "__main__":
     tokenizer = load_tokenizer(model_name)
 
     print(f"Loading model: {model_name} on {device} with dtype={dtype}")
-    model = load_model(model_name, dtype)
+    model = load_model(model_name, dtype, attn_implementation="sdpa")
     model.eval()
 
     # Add dummy adapter so peft_config exists and we can use the consistent PeftModel API

@@ -314,6 +314,12 @@ def create_training_datapoint(
         padding=False,
         enable_thinking=False,
     )
+    # Extract list of token IDs from BatchEncoding if needed
+    if not isinstance(input_prompt_ids, list):
+        if hasattr(input_prompt_ids, 'input_ids'):
+            input_prompt_ids = input_prompt_ids.input_ids
+        else:
+            input_prompt_ids = input_prompt_ids[0].ids if hasattr(input_prompt_ids[0], 'ids') else list(input_prompt_ids[0])
     if not isinstance(input_prompt_ids, list):
         raise TypeError("Expected list of token ids from tokenizer")
 
@@ -327,6 +333,12 @@ def create_training_datapoint(
         padding=False,
         enable_thinking=False,
     )
+    # Extract list of token IDs from BatchEncoding if needed
+    if not isinstance(full_prompt_ids, list):
+        if hasattr(full_prompt_ids, 'input_ids'):
+            full_prompt_ids = full_prompt_ids.input_ids
+        else:
+            full_prompt_ids = full_prompt_ids[0].ids if hasattr(full_prompt_ids[0], 'ids') else list(full_prompt_ids[0])
     if not isinstance(full_prompt_ids, list):
         raise TypeError("Expected list of token ids from tokenizer")
 

@@ -191,3 +191,5 @@ openai_api_key.txt
 *checkpoints*
 *max_acts*
 *model_lora*
+run_demo_gpu.sbatch
+logs/
