@@ -186,7 +186,30 @@ def get_hf_activation_steering_hook(
                     print(f"\n\n\n\n\nWARNING: Large norm detected in batch! {norms_K1}\n\n\n\n\n")
 
             # Build steered vectors for this b
-            steered_KD = (normed_list[b] *  norms_K1 * steering_coefficient).to(dtype)  # (K_b, d)
+            steered_KD = (normed_list[b] *  norms_K1 * steering_coefficient).to(dtype)  # (K_b, d_oracle)
+            
+            # Handle dimension mismatch between oracle and target models
+            if steered_KD.shape[-1] != orig_KD.shape[-1]:
+                if d_model_actual > steered_KD.shape[-1]:
+                    # Target model is larger: project steering vectors up
+                    projection = torch.zeros(
+                        steered_KD.shape[-1], d_model_actual, 
+                        device=device, dtype=dtype
+                    )
+                    # Simple identity projection for missing dimensions
+                    min_dim = min(steered_KD.shape[-1], d_model_actual)
+                    projection[:min_dim, :min_dim] = torch.eye(min_dim, device=device, dtype=dtype)
+                    steered_KD = steered_KD @ projection
+                else:
+                    # Target model is smaller: project steering vectors down
+                    projection = torch.zeros(
+                        steered_KD.shape[-1], d_model_actual, 
+                        device=device, dtype=dtype
+                    )
+                    # Simple identity projection for overlapping dimensions
+                    min_dim = min(steered_KD.shape[-1], d_model_actual)
+                    projection[:min_dim, :min_dim] = torch.eye(min_dim, device=device, dtype=dtype)
+                    steered_KD = steered_KD @ projection
 
             resid_BLD[b, pos_b, :] = steered_KD.detach() + orig_KD
 
