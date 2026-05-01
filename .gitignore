@@ -193,3 +193,4 @@ openai_api_key.txt
 *model_lora*
 run_demo_gpu.sbatch
 logs/
+.venv_old/

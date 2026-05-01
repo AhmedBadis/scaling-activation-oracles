@@ -1162,8 +1162,8 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 16
-    gradient_checkpointing = True
+    train_batch_size = 4
+    gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
     if target_model_name == "Qwen/Qwen3-32B" or target_model_name == "meta-llama/Llama-3.3-70B-Instruct":
@@ -1183,7 +1183,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 4
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(
@@ -1207,7 +1207,7 @@ if __name__ == "__main__":
         {
             "load_lora_path": None,
             "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
-            "wandb_suffix": f"_latentqa_cls_past_lens_oracle_{cfg.target_model_name.split('/')[-1]}_target_{cfg.oracle_model_name.split('/')[-1]}",
+            "wandb_suffix": f"_latentqa_cls_past_lens_oracle_{cfg.oracle_model_name.split('/')[-1]}_target_{cfg.target_model_name.split('/')[-1]}",
         },
         # {
         #     "load_lora_path": None,

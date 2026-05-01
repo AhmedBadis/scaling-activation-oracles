@@ -11,7 +11,7 @@ from nl_probes.utils.common import layer_percent_to_layer
 @dataclass
 class SelfInterpTrainingConfig:
     # --- Models ---
-    oracle_model_name: str = "Qwen/Qwen3-1.7B"
+    oracle_model_name: str = "Qwen/Qwen3.5-4B"
     target_model_name: str = "Qwen/Qwen3-4B"
     hook_onto_layer: int = 1
     layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
