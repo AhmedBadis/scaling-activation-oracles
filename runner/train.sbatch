@@ -3,9 +3,9 @@
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --job-name=personaqa_train
-#SBATCH --output=logs/personaqa_train/%j.out
-#SBATCH --error=logs/personaqa_train/%j.err
+#SBATCH --job-name=train
+#SBATCH --output=logs/train/%j.out
+#SBATCH --error=logs/train/%j.err
 
 module load Python/3.11.3-GCCcore-12.3.0
 export CUDA_VISIBLE_DEVICES=0
@@ -44,7 +44,7 @@ NUM_GPUS=1
 # run training with torchrun
 # adjust nl_probes/sft.py args as needed, e.g., --config config.yaml --batch-size 8
 torchrun --nproc_per_node=$NUM_GPUS nl_probes/sft.py \
-  --output_dir outputs/personaqa \
+  --output_dir outputs/train \
   --per_device_train_batch_size 4 \
   --gradient_accumulation_steps 1 \
   --num_train_epochs 3

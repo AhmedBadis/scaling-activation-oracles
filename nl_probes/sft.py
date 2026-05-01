@@ -528,7 +528,7 @@ def train_model(
     model_kwargs = {**model_kwargs, "device_map": {"": f"cuda:{local_rank}"}}
 
     set_seed(cfg.seed)
-    model = load_model(cfg.model_name, dtype, **model_kwargs)
+    model = load_model(cfg.oracle_model_name, dtype, **model_kwargs)
 
     model.enable_input_require_grads()
 
@@ -1149,24 +1149,24 @@ if __name__ == "__main__":
         "singular_plural": {"num_train": 0, "num_test": main_test_size, "splits": ["test"]},
     }
 
-    # Use oracle model for dataset preprocessing
-    oracle_model_name = cfg.oracle_model_name
-    print(f"Using oracle model for dataset preprocessing: {oracle_model_name}")
+    # Use target model for dataset preprocessing
+    target_model_name = cfg.target_model_name
+    print(f"Using target model for dataset preprocessing: {target_model_name}")
     
-    # Set up oracle model for dataset preprocessing
+    # Set up target model for dataset preprocessing and activation collection
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{local_rank}")
 
     hook_layer = 1
     
-    # Process datasets using oracle model
-    model_name_str = oracle_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
+    # Process datasets using target model
+    model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
     train_batch_size = 16
     gradient_checkpointing = True
     model_kwargs = {"attn_implementation": "sdpa"}
 
-    if oracle_model_name == "Qwen/Qwen3-32B" or oracle_model_name == "meta-llama/Llama-3.3-70B-Instruct":
+    if target_model_name == "Qwen/Qwen3-32B" or target_model_name == "meta-llama/Llama-3.3-70B-Instruct":
         bnb_config = BitsAndBytesConfig(
             load_in_8bit=True,
             bnb_8bit_compute_dtype=dtype,
@@ -1185,9 +1185,9 @@ if __name__ == "__main__":
 
     gradient_accumulation_steps = 1
 
-    # Build loader groups using oracle model for dataset preprocessing
+    # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(
-        model_name=oracle_model_name,  # Use oracle model for datasets
+        model_name=target_model_name,  # Use target model for datasets
         layer_percents=layer_percents,
         act_collection_batch_size=train_batch_size,
         save_acts=save_acts,
@@ -1207,7 +1207,7 @@ if __name__ == "__main__":
         {
             "load_lora_path": None,
             "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
-            "wandb_suffix": f"_latentqa_cls_past_lens_oracle_{oracle_model_name.split('/')[-1]}_target_{cfg.target_model_name.split('/')[-1]}",
+            "wandb_suffix": f"_latentqa_cls_past_lens_oracle_{cfg.target_model_name.split('/')[-1]}_target_{cfg.oracle_model_name.split('/')[-1]}",
         },
         # {
         #     "load_lora_path": None,
@@ -1242,7 +1242,7 @@ if __name__ == "__main__":
 
         print(f"save dir: {cfg.save_dir}")
 
-        tokenizer = load_tokenizer(cfg.target_model_name)  # Use target model for training
+        tokenizer = load_tokenizer(cfg.oracle_model_name)  # Use oracle model for training
 
         # Ensure only rank 0 performs any on-disk dataset creation
         if local_rank == 0:
