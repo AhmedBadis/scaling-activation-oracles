@@ -24,7 +24,7 @@ dependencies = [
     "torch==2.7.1",
     "flash-attn",
     "torchdata",
-    "transformers==4.55.2",
+    "transformers==5.7.0",
     "vllm==0.10.0",
     "einops==0.8.1",
     "wandb==0.21.1",

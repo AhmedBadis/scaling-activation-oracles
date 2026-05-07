@@ -159,7 +159,7 @@ def get_prompt_tokens_only(
 def materialize_missing_steering_vectors(
     batch_points: list[TrainingDataPoint],
     tokenizer: AutoTokenizer,
-    model: PeftModel,
+    model,
 ) -> list[TrainingDataPoint]:
     """
     Materialization of missing steering vectors for a heterogenous batch
@@ -180,8 +180,6 @@ def materialize_missing_steering_vectors(
     ]
     if not to_fill:
         return batch_points
-
-    assert isinstance(model, PeftModel), "Model must be a PeftModel"
 
     # Validate context fields
     for _, dp in to_fill:
@@ -216,13 +214,22 @@ def materialize_missing_steering_vectors(
 
     # Prepare hooks for all unique requested layers
     layers_needed = sorted({dp.layer for _, dp in to_fill})
-    submodules = {layer: get_hf_submodule(model, layer, use_lora=True) for layer in layers_needed}
+    use_lora = isinstance(model, PeftModel)
+    submodules = {layer: get_hf_submodule(model, layer, use_lora=use_lora) for layer in layers_needed}
 
     # Run a single pass with dropout off, then restore the previous train/eval mode
     was_training = model.training
     model.eval()
-    with model.disable_adapter():
-        # [layer] -> [B, L, D], where B == len(to_fill)
+    if hasattr(model, "disable_adapter"):
+        with model.disable_adapter():
+            acts_by_layer = collect_activations_multiple_layers(
+                model=model,
+                submodules=submodules,
+                inputs_BL=inputs_BL,
+                min_offset=None,
+                max_offset=None,
+            )
+    else:
         acts_by_layer = collect_activations_multiple_layers(
             model=model,
             submodules=submodules,

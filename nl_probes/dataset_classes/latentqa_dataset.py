@@ -52,7 +52,9 @@ class LatentQADatasetLoader(ActDatasetLoader):
             )
 
     def create_dataset(self) -> None:
-        tokenizer = load_tokenizer(self.dataset_config.model_name)
+        context_tokenizer = load_tokenizer(self.dataset_config.model_name)
+        prompt_model_name = self.dataset_config.prompt_model_name or self.dataset_config.model_name
+        prompt_tokenizer = load_tokenizer(prompt_model_name)
 
         layers = [
             layer_percent_to_layer(self.dataset_config.model_name, layer_percent)
@@ -79,7 +81,11 @@ class LatentQADatasetLoader(ActDatasetLoader):
         training_data = []
 
         for dp in tqdm(ds, desc="Creating latentqa dataset"):
-            training_data.append(create_latentqa_training_datapoint(dp, tokenizer, layers, self.dataset_params))
+            training_data.append(
+                create_latentqa_training_datapoint(
+                    dp, context_tokenizer, prompt_tokenizer, layers, self.dataset_params
+                )
+            )
 
         self.save_dataset(training_data, "train")
 
@@ -98,7 +104,11 @@ class LatentQADatapoint(BaseModel):
 
 
 def create_latentqa_training_datapoint(
-    datapoint_dict: dict, tokenizer: AutoTokenizer, act_layers: list[int], dataset_params: LatentQADatasetConfig
+    datapoint_dict: dict,
+    context_tokenizer: AutoTokenizer,
+    prompt_tokenizer: AutoTokenizer,
+    act_layers: list[int],
+    dataset_params: LatentQADatasetConfig,
 ) -> TrainingDataPoint:
     masked_turn_count = {"stimulus_completion": 2, "stimulus": 2, "control": 0}
 
@@ -109,8 +119,8 @@ def create_latentqa_training_datapoint(
     masked_turns = datapoint.read_prompt[:num_masked]
 
     if num_masked > 0:
-        masked_str = tokenizer.apply_chat_template(masked_turns, tokenize=False, enable_thinking=False)
-        masked_tokens = tokenizer(masked_str, return_tensors=None, add_special_tokens=False, padding=False)["input_ids"]
+        masked_str = context_tokenizer.apply_chat_template(masked_turns, tokenize=False, enable_thinking=False)
+        masked_tokens = context_tokenizer(masked_str, return_tensors=None, add_special_tokens=False, padding=False)["input_ids"]
     else:
         masked_tokens = []
 
@@ -119,11 +129,11 @@ def create_latentqa_training_datapoint(
     else:
         add_generation_prompt = True
 
-    full_read_str = tokenizer.apply_chat_template(
+    full_read_str = context_tokenizer.apply_chat_template(
         datapoint.read_prompt, tokenize=False, add_generation_prompt=add_generation_prompt, enable_thinking=False
     )
 
-    context_input_ids = tokenizer(full_read_str, return_tensors=None, add_special_tokens=False, padding=False)[
+    context_input_ids = context_tokenizer(full_read_str, return_tensors=None, add_special_tokens=False, padding=False)[
         "input_ids"
     ]
 
@@ -154,7 +164,7 @@ def create_latentqa_training_datapoint(
         target_response=datapoint.dialog[1].content,
         layer=layer,
         num_positions=len(context_positions),
-        tokenizer=tokenizer,
+        tokenizer=prompt_tokenizer,
         acts_BD=None,
         feature_idx=-1,
         context_input_ids=context_input_ids,

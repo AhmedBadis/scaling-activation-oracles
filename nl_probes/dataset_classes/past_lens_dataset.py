@@ -52,15 +52,18 @@ class PastLensDatasetLoader(ActDatasetLoader):
             )
 
     def create_dataset(self) -> None:
-        tokenizer = load_tokenizer(self.dataset_config.model_name)
-        dataset = hf_mixed_dataset_to_generator(tokenizer)
+        context_tokenizer = load_tokenizer(self.dataset_config.model_name)
+        prompt_model_name = self.dataset_config.prompt_model_name or self.dataset_config.model_name
+        prompt_tokenizer = load_tokenizer(prompt_model_name)
+        dataset = hf_mixed_dataset_to_generator(context_tokenizer)
 
         dtype = torch.bfloat16
 
         training_data = collect_past_lens_acts(
             dataset_config=self.dataset_config,
             custom_dataset_params=self.dataset_params,
-            tokenizer=tokenizer,
+            context_tokenizer=context_tokenizer,
+            prompt_tokenizer=prompt_tokenizer,
             dataset=dataset,
             num_datapoints=self.dataset_config.num_train,
             dtype=dtype,
@@ -169,7 +172,8 @@ def hf_mixed_dataset_to_generator(
 def collect_past_lens_acts(
     dataset_config: DatasetLoaderConfig,
     custom_dataset_params: PastLensDatasetConfig,
-    tokenizer: AutoTokenizer,
+    context_tokenizer: AutoTokenizer,
+    prompt_tokenizer: AutoTokenizer,
     dataset: Generator,
     num_datapoints: int,
     dtype: torch.dtype,
@@ -195,7 +199,7 @@ def collect_past_lens_acts(
         for _ in range(dataset_config.batch_size):
             inputs.append(next(dataset))
 
-        tokenized_inputs = tokenizer(
+        tokenized_inputs = context_tokenizer(
             inputs,
             return_tensors="pt",
             padding=True,
@@ -244,7 +248,7 @@ def collect_past_lens_acts(
                     # Context only needs to include up through the last act position
                     context_cutoff = selected_act_positions[-1]
                     target_tokens = input_ids_L_full[selected_tokens_positions]
-                    target_text = tokenizer.decode(target_tokens, skip_special_tokens=True)
+                    target_text = context_tokenizer.decode(target_tokens, skip_special_tokens=True)
                     prompt = f"Can you predict the previous {k_tokens} tokens that came before this?"
                 else:  # direction == "future"
                     # Need at least 1 token before the act span and k_tokens after the act span
@@ -261,7 +265,7 @@ def collect_past_lens_acts(
                     # Context only needs to include up through the last act position
                     context_cutoff = last_act_pos
                     target_tokens = input_ids_L_full[selected_tokens_positions]
-                    target_text = tokenizer.decode(target_tokens, skip_special_tokens=True)
+                    target_text = context_tokenizer.decode(target_tokens, skip_special_tokens=True)
                     prompt = f"Can you predict the next {k_tokens} tokens that come after this?"
 
                 # Slice context input ids to what is needed to compute acts (up through last act pos)
@@ -284,7 +288,7 @@ def collect_past_lens_acts(
                     target_response=target_text,
                     layer=layer,
                     num_positions=k_acts,
-                    tokenizer=tokenizer,
+                    tokenizer=prompt_tokenizer,
                     acts_BD=selected_acts_KD,
                     feature_idx=-1,
                     context_input_ids=context_input_ids,

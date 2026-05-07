@@ -65,7 +65,9 @@ class ClassificationDatasetLoader(ActDatasetLoader):
         assert self.dataset_params.max_window_size > 0, "Max window size must be positive"
 
     def create_dataset(self) -> None:
-        tokenizer = load_tokenizer(self.dataset_config.model_name)
+        context_tokenizer = load_tokenizer(self.dataset_config.model_name)
+        prompt_model_name = self.dataset_config.prompt_model_name or self.dataset_config.model_name
+        prompt_tokenizer = load_tokenizer(prompt_model_name)
 
         train_datapoints, test_datapoints = get_classification_datapoints(
             self.dataset_params.classification_dataset_name,
@@ -85,7 +87,8 @@ class ClassificationDatasetLoader(ActDatasetLoader):
 
             data = create_vector_dataset(
                 datapoints,
-                tokenizer,
+                context_tokenizer,
+                prompt_tokenizer,
                 self.dataset_config.model_name,
                 self.dataset_config.batch_size,
                 self.act_layers,
@@ -167,6 +170,7 @@ def view_tokens(tokens_L: list[int], tokenizer: AutoTokenizer, offset: int) -> N
 def create_vector_dataset(
     datapoints: list[ClassificationDatapoint],
     tokenizer: AutoTokenizer,
+    prompt_tokenizer: AutoTokenizer,
     model_name: str,
     batch_size: int,
     act_layers: list[int],
@@ -257,7 +261,7 @@ def create_vector_dataset(
                     target_response=batch_datapoints[j].target_response,
                     layer=layer,
                     num_positions=k,
-                    tokenizer=tokenizer,
+                    tokenizer=prompt_tokenizer,
                     acts_BD=acts_KD,
                     feature_idx=-1,
                     context_input_ids=input_ids_L,

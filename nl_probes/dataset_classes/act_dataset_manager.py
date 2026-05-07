@@ -24,6 +24,7 @@ class DatasetLoaderConfig:
     layer_percents: list[int]
     save_acts: bool
     batch_size: int
+    prompt_model_name: str | None = None
     dataset_name: str = ""
     dataset_folder: str = "sft_training_data"
     seed: int = 42

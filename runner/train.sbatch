@@ -30,22 +30,14 @@ export WANDB_API_KEY="wandb_v1_VOZZi2EDECIeiGCRIx0ygI7bWIv_VgXSGgXfvxpYHhZKAVCcs
 echo "== env =="
 which python
 python --version
-python - <<'PY'
+python << 'PY'
 import torch, os
-print("torch:", getattr(torch,'__version__',None))
-print("cuda available:", torch.cuda.is_available())
-print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
-if torch.cuda.is_available():
-    print("device name:", torch.cuda.get_device_name(0))
+print(torch.cuda.is_available())
+print(torch.version.cuda)
+print(os.environ.get('CUDA_VISIBLE_DEVICES'))
 PY
 
-# number of GPUs to use for torchrun
-NUM_GPUS=1
-
-# run training with torchrun
-# adjust nl_probes/sft.py args as needed, e.g., --config config.yaml --batch-size 8
-torchrun --nproc_per_node=$NUM_GPUS nl_probes/sft.py \
-  --output_dir outputs/train \
-  --per_device_train_batch_size 4 \
-  --gradient_accumulation_steps 4 \
-  --num_train_epochs 3
+# Use working checkpoint and correct command line arguments
+torchrun --nproc_per_node=1 nl_probes/sft.py \
+    --oracle_model_name=Qwen/Qwen3.5-4B \
+    --target_model_name=Qwen/Qwen3-4B

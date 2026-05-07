@@ -109,9 +109,15 @@ def run_evaluation(
     eval_batch_size: int,
     steering_coefficient: float,
     generation_kwargs: dict,
+    activation_tokenizer: PreTrainedTokenizer | None = None,
+    activation_model: AutoModelForCausalLM | None = None,
     verbose: bool = False,
 ) -> list[FeatureResult]:
     """Run evaluation and save results."""
+    if activation_tokenizer is None:
+        activation_tokenizer = tokenizer
+    if activation_model is None:
+        activation_model = model
     if lora_path is not None:
         adapter_name = lora_path
         if adapter_name not in model.peft_config:
@@ -128,7 +134,7 @@ def run_evaluation(
             for j in range(len(e_batch)):
                 e_batch[j] = get_prompt_tokens_only(e_batch[j])
 
-            e_batch = materialize_missing_steering_vectors(e_batch, tokenizer, model)
+            e_batch = materialize_missing_steering_vectors(e_batch, activation_tokenizer, activation_model)
 
             e_batch = construct_batch(e_batch, tokenizer, device)
 
@@ -170,6 +176,7 @@ def score_eval_responses(
 ) -> tuple[float, float]:
     format_correct_list = []
     ans_correct_list = []
+    
     for eval_response, eval_data_point in zip(eval_responses, eval_dataset, strict=True):
         cleaned_response = parse_answer(eval_response.api_response)
         target_response = parse_answer(eval_data_point.target_output)
@@ -180,6 +187,7 @@ def score_eval_responses(
 
     percent_format_correct = sum(format_correct_list) / len(format_correct_list)
     percent_ans_correct = sum(ans_correct_list) / len(ans_correct_list)
+    
     return percent_format_correct, percent_ans_correct
 
 

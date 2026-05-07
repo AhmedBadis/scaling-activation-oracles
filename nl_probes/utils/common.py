@@ -28,7 +28,7 @@ def load_model(
     kwargs: dict = {
         "device_map": "auto",
         "attn_implementation": attn,
-        "dtype": dtype,
+        "torch_dtype": dtype,
         **model_kwargs,
     }
 

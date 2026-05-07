@@ -104,7 +104,7 @@ def train_with_sft_only(
     llm_kwargs = dict(
         pretrained_model_name_or_path=config.model_name,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         use_cache=False,
     )

@@ -188,28 +188,12 @@ def get_hf_activation_steering_hook(
             # Build steered vectors for this b
             steered_KD = (normed_list[b] *  norms_K1 * steering_coefficient).to(dtype)  # (K_b, d_oracle)
             
-            # Handle dimension mismatch between oracle and target models
             if steered_KD.shape[-1] != orig_KD.shape[-1]:
-                if d_model_actual > steered_KD.shape[-1]:
-                    # Target model is larger: project steering vectors up
-                    projection = torch.zeros(
-                        steered_KD.shape[-1], d_model_actual, 
-                        device=device, dtype=dtype
-                    )
-                    # Simple identity projection for missing dimensions
-                    min_dim = min(steered_KD.shape[-1], d_model_actual)
-                    projection[:min_dim, :min_dim] = torch.eye(min_dim, device=device, dtype=dtype)
-                    steered_KD = steered_KD @ projection
-                else:
-                    # Target model is smaller: project steering vectors down
-                    projection = torch.zeros(
-                        steered_KD.shape[-1], d_model_actual, 
-                        device=device, dtype=dtype
-                    )
-                    # Simple identity projection for overlapping dimensions
-                    min_dim = min(steered_KD.shape[-1], d_model_actual)
-                    projection[:min_dim, :min_dim] = torch.eye(min_dim, device=device, dtype=dtype)
-                    steered_KD = steered_KD @ projection
+                raise ValueError(
+                    "Steering vector width does not match oracle residual width. "
+                    f"Got steering width={steered_KD.shape[-1]} and oracle width={orig_KD.shape[-1]}. "
+                    "Cross-model runs with different hidden sizes require an explicit learned projection."
+                )
 
             resid_BLD[b, pos_b, :] = steered_KD.detach() + orig_KD
 

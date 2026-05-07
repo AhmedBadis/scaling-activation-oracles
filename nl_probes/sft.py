@@ -53,7 +53,7 @@ from nl_probes.utils.dataset_utils import (
     construct_batch,
     materialize_missing_steering_vectors,
 )
-from nl_probes.utils.eval import run_evaluation, score_eval_responses
+from nl_probes.utils.eval import run_evaluation, score_eval_responses, parse_answer
 
 
 def push_lora_to_hf(
@@ -237,6 +237,8 @@ def eval_all_datasets(
     eval_datasets: dict[str, list[TrainingDataPoint]],
     model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizer,
+    activation_tokenizer: PreTrainedTokenizer,
+    activation_model: AutoModelForCausalLM,
     submodule: torch.nn.Module,
     device: torch.device,
     dtype: torch.dtype,
@@ -249,25 +251,42 @@ def eval_all_datasets(
             eval_data=eval_datasets[ds],
             model=model,
             tokenizer=tokenizer,
+            activation_tokenizer=activation_tokenizer,
+            activation_model=activation_model,
             submodule=submodule,
             device=device,
             dtype=dtype,
             global_step=global_step,
-            lora_path=None,
+            lora_path=cfg.load_lora_path,
             eval_batch_size=cfg.eval_batch_size,
             steering_coefficient=cfg.steering_coefficient,
             generation_kwargs=cfg.generation_kwargs,
         )
+        
+        # DEBUG: Show oracle vs model responses
+        if len(eval_responses) > 0 and len(eval_datasets[ds]) > 0:
+            print(f"\n=== DEBUG EVAL {ds} at step {global_step} ===")
+            for i in range(min(3, len(eval_responses), len(eval_datasets[ds]))):
+                oracle_target = eval_datasets[ds][i].target_output
+                model_response = eval_responses[i].api_response
+                print(f"Example {i}:")
+                print(f"  Oracle target: '{oracle_target}'")
+                print(f"  Model response: '{model_response}'")
+                print(f"  Parsed oracle: '{parse_answer(oracle_target)}'")
+                print(f"  Parsed model: '{parse_answer(model_response)}'")
+            print("=" * 50)
+        
         percent_format_correct, percent_ans_correct = score_eval_responses(eval_responses, eval_datasets[ds])
         eval_results[f"eval_format_correct/{ds}"] = percent_format_correct
         eval_results[f"eval_ans_correct/{ds}"] = percent_ans_correct
         print(f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
-
-    wandb.log(
-        eval_results,
-        step=global_step,
-    )
-    wandb.summary.update(eval_results)
+    
+    if wandb.run is not None:
+        wandb.log(
+            eval_results,
+            step=global_step,
+        )
+        wandb.summary.update(eval_results)
     model.train()
 
     # Have occasionally seen OOMs on first training step after eval, so clear cache here
@@ -281,12 +300,14 @@ def oom_preflight_check(
     model: AutoModelForCausalLM,
     submodule: torch.nn.Module,
     tokenizer: PreTrainedTokenizer,
+    activation_tokenizer: PreTrainedTokenizer,
+    activation_model: AutoModelForCausalLM,
     device: torch.device,
     dtype: torch.dtype,
 ) -> None:
     longest_prompt = max(training_data, key=lambda x: len(x.input_ids))
     long_prompts = [longest_prompt] * cfg.train_batch_size
-    long_prompts = materialize_missing_steering_vectors(long_prompts, tokenizer, model)
+    long_prompts = materialize_missing_steering_vectors(long_prompts, activation_tokenizer, activation_model)
     largest_possible_batch = construct_batch(long_prompts, tokenizer, device)
 
     dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
@@ -529,6 +550,15 @@ def train_model(
 
     set_seed(cfg.seed)
     model = load_model(cfg.oracle_model_name, dtype, **model_kwargs)
+    activation_tokenizer = tokenizer
+    activation_model: AutoModelForCausalLM = model
+
+    if cfg.oracle_model_name != cfg.target_model_name:
+        if rank == 0:
+            print(f"Loading target model for activation collection: {cfg.target_model_name}")
+        activation_tokenizer = load_tokenizer(cfg.target_model_name)
+        activation_model = load_model(cfg.target_model_name, dtype, **model_kwargs)
+        activation_model.eval()
 
     model.enable_input_require_grads()
 
@@ -546,14 +576,24 @@ def train_model(
                 print(f"VLM detected ({cfg.model_name}): excluding vision tower from LoRA")
             target_modules = vlm_targets
 
-        lora_config = LoraConfig(
-            r=cfg.lora_r,
-            lora_alpha=cfg.lora_alpha,
-            lora_dropout=cfg.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
+        # Handle Qwen3.5-4B PEFT naming issue
+        if cfg.oracle_model_name == "Qwen/Qwen3.5-4B":
+            lora_config = LoraConfig(
+                r=cfg.lora_r, 
+                lora_alpha=cfg.lora_alpha, 
+                lora_dropout=cfg.lora_dropout,
+                target_modules=cfg.lora_target_modules,
+                bias='none',
+                base_model_name_or_path=cfg.oracle_model_name  # Explicitly set to prevent incorrect mapping
+            )
+        else:
+            lora_config = LoraConfig(
+                r=cfg.lora_r, 
+                lora_alpha=cfg.lora_alpha, 
+                lora_dropout=cfg.lora_dropout,
+                target_modules=cfg.lora_target_modules,
+                bias='none'
+            )
         model = get_peft_model(model, lora_config, autocast_adapter_dtype=True)
     elif cfg.load_lora_path is not None:
         load_lora_path = Path(cfg.load_lora_path)
@@ -568,7 +608,17 @@ def train_model(
     )
     train_model_module.train()
 
-    oom_preflight_check(cfg, training_data, model, submodule, tokenizer, device, dtype)
+    oom_preflight_check(
+        cfg,
+        training_data,
+        model,
+        submodule,
+        tokenizer,
+        activation_tokenizer,
+        activation_model,
+        device,
+        dtype,
+    )
 
     set_seed(cfg.seed)
 
@@ -665,6 +715,25 @@ def train_model(
         wandb.summary["train/tokens_per_epoch_est"] = tokens_per_epoch_est
         wandb.summary["train/total_tokens_est"] = total_training_tokens_est
         wandb.summary["train/num_examples_pre_shard"] = num_examples_pre_shard
+        
+        # DEBUG: Show training data examples at start
+        print(f"\n=== DEBUG TRAINING DATA at step {global_step} ===")
+        for i in range(min(3, len(training_data))):
+            data_point = training_data[i]
+            # Get prompt using target tokenizer (consistent with activation data)
+            prompt_tokens = data_point.input_ids[:data_point.context_positions[0]] if data_point.context_positions else data_point.input_ids[:10]
+            prompt = tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+            print(f"Training example {i}:")
+            print(f"  Prompt: '{prompt[:100]}...'")
+            print(f"  Target output: '{data_point.target_output}'")
+            print(f"  Parsed target: '{parse_answer(data_point.target_output)}'")
+            # DEBUG: Check raw input_ids for corruption
+            if i == 0:  # Only for first example
+                print(f"  DEBUG: Raw input_ids first 20: {data_point.input_ids[:20]}")
+                print(f"  DEBUG: Decoded prompt: '{prompt[:100]}...'")
+                print(f"  DEBUG: Context positions: {data_point.context_positions[:5]}")
+                print(f"  DEBUG: Input_ids length: {len(data_point.input_ids)}")
+        print("=" * 50)
 
     # If resuming, compute starting epoch and how many updates were done in that epoch
     resumed_updates = global_step
@@ -701,7 +770,7 @@ def train_model(
 
             t_batch_list: list["TrainingDataPoint"] = training_data[start : start + cfg.train_batch_size]
 
-            t_batch_list = materialize_missing_steering_vectors(t_batch_list, tokenizer, model)
+            t_batch_list = materialize_missing_steering_vectors(t_batch_list, activation_tokenizer, activation_model)
             t_batch = construct_batch(t_batch_list, tokenizer, device)
 
             loss = train_features_batch(cfg, t_batch, train_model_module, submodule, device, dtype)
@@ -730,7 +799,18 @@ def train_model(
 
                 if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
-                        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+                        eval_all_datasets(
+                            cfg,
+                            eval_datasets,
+                            model,
+                            tokenizer,
+                            activation_tokenizer,
+                            activation_model,
+                            submodule,
+                            device,
+                            dtype,
+                            global_step,
+                        )
                     dist.barrier()
 
                 # Checkpoint on update steps
@@ -761,7 +841,18 @@ def train_model(
         model.save_pretrained(f"{cfg.save_dir}/final")
 
         print("Running final evaluation...")
-        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+        eval_all_datasets(
+            cfg,
+            eval_datasets,
+            model,
+            tokenizer,
+            activation_tokenizer,
+            activation_model,
+            submodule,
+            device,
+            dtype,
+            global_step,
+        )
         wandb.finish()
 
         if cfg.hf_push_to_hub and cfg.hf_repo_id:
@@ -795,9 +886,17 @@ def build_datasets(
 
     for dataset_loader in dataset_loaders:
         if "train" in dataset_loader.dataset_config.splits:
-            all_training_data.extend(dataset_loader.load_dataset("train"))
+            train_data = dataset_loader.load_dataset("train")
+            print(f"DEBUG: Loaded {len(train_data)} items from {dataset_loader.dataset_config.dataset_name}")
+            if len(train_data) > 0:
+                sample = train_data[0]
+                print(f"DEBUG: Sample target_output: {repr(sample.target_output[:100] if hasattr(sample, 'target_output') else 'no target')}")
+                print(f"DEBUG: Sample context_input_ids length: {len(sample.context_input_ids) if hasattr(sample, 'context_input_ids') else 'no context'}")
+            all_training_data.extend(train_data)
         if "test" in dataset_loader.dataset_config.splits:
-            all_eval_data[dataset_loader.dataset_config.dataset_name] = dataset_loader.load_dataset("test")
+            test_data = dataset_loader.load_dataset("test")
+            print(f"DEBUG: Loaded {len(test_data)} test items from {dataset_loader.dataset_config.dataset_name}")
+            all_eval_data[dataset_loader.dataset_config.dataset_name] = test_data
 
     p = max_len_percentile
     if p is not None:
@@ -833,6 +932,7 @@ def mk_cfg(
     num_test: int,
     splits: list[str],
     model_name: str,
+    prompt_model_name: str | None,
     layer_percents: list[int],
     save_acts: bool,
     batch_size: int,
@@ -843,6 +943,7 @@ def mk_cfg(
         num_test=num_test,
         splits=splits,
         model_name=model_name,
+        prompt_model_name=prompt_model_name,
         layer_percents=layer_percents,
         save_acts=save_acts,
         batch_size=batch_size,
@@ -852,6 +953,7 @@ def mk_cfg(
 def build_loader_groups(
     *,
     model_name: str,
+    prompt_model_name: str,
     layer_percents: list[int],
     act_collection_batch_size: int,
     save_acts: bool,
@@ -878,6 +980,7 @@ def build_loader_groups(
             num_test=0,
             splits=["train"],
             model_name=model_name,
+            prompt_model_name=prompt_model_name,
             layer_percents=layer_percents,
             save_acts=save_acts,
             batch_size=train_batch_size,
@@ -894,6 +997,7 @@ def build_loader_groups(
             num_test=0,
             splits=["train"],
             model_name=model_name,
+            prompt_model_name=prompt_model_name,
             layer_percents=layer_percents,
             save_acts=save_acts,
             batch_size=train_batch_size,
@@ -907,6 +1011,7 @@ def build_loader_groups(
             num_test=0,
             splits=["train"],
             model_name=model_name,
+            prompt_model_name=prompt_model_name,
             layer_percents=layer_percents,
             save_acts=False,
             batch_size=train_batch_size,
@@ -932,6 +1037,7 @@ def build_loader_groups(
                     num_test=0,
                     splits=["train"],
                     model_name=model_name,
+                    prompt_model_name=prompt_model_name,
                     layer_percents=[layer_percent],
                     save_acts=True,
                     batch_size=0,
@@ -950,6 +1056,7 @@ def build_loader_groups(
                     num_test=0,
                     splits=["train"],
                     model_name=model_name,
+                    prompt_model_name=prompt_model_name,
                     layer_percents=[layer_percent],
                     save_acts=True,
                     batch_size=0,
@@ -965,6 +1072,7 @@ def build_loader_groups(
                     num_test=0,
                     splits=["train"],
                     model_name=model_name,
+                    prompt_model_name=prompt_model_name,
                     layer_percents=[layer_percent],
                     save_acts=True,
                     batch_size=0,
@@ -1004,6 +1112,7 @@ def build_loader_groups(
                     num_test=meta["num_test"],
                     splits=meta["splits"],
                     model_name=model_name,
+                    prompt_model_name=prompt_model_name,
                     layer_percents=layer_percents,
                     save_acts=save_acts,
                     batch_size=bs,
@@ -1020,6 +1129,7 @@ def build_loader_groups(
                     num_test=meta["num_test"],
                     splits=meta["splits"],
                     model_name=model_name,
+                    prompt_model_name=prompt_model_name,
                     layer_percents=layer_percents,
                     save_acts=save_acts,
                     batch_size=train_batch_size,
@@ -1099,7 +1209,7 @@ if __name__ == "__main__":
         assert cfg.target_model_name, "Target model name must be set"
         if cfg.oracle_model_name == cfg.target_model_name:
             print("Warning: Oracle and target models are the same")
-
+        
     main_train_size = 6000
     main_test_size = 250
     classification_datasets = {
@@ -1188,6 +1298,7 @@ if __name__ == "__main__":
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(
         model_name=target_model_name,  # Use target model for datasets
+        prompt_model_name=cfg.oracle_model_name,
         layer_percents=layer_percents,
         act_collection_batch_size=train_batch_size,
         save_acts=save_acts,
@@ -1242,7 +1353,18 @@ if __name__ == "__main__":
 
         print(f"save dir: {cfg.save_dir}")
 
-        tokenizer = load_tokenizer(cfg.oracle_model_name)  # Use oracle model for training
+        tokenizer = load_tokenizer(cfg.oracle_model_name)  # Use oracle tokenizer for train/eval model inputs
+        
+        # DEBUG: Test oracle tokenizer behavior
+        if local_rank == 0:
+            print(f"\n=== Using Oracle Tokenizer {cfg.oracle_model_name} for Training ===")
+            test_yes = tokenizer.encode('Yes')
+            test_no = tokenizer.encode('No')
+            print(f'"Yes" tokens: {test_yes}')
+            print(f'"No" tokens: {test_no}')
+            print(f'"Yes" decoded: "{tokenizer.decode(test_yes)}"')
+            print(f'"No" decoded: "{tokenizer.decode(test_no)}"')
+            print("=" * 50)
 
         # Ensure only rank 0 performs any on-disk dataset creation
         if local_rank == 0:
