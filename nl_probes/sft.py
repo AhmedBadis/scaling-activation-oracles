@@ -6,6 +6,8 @@ import gc
 import json
 import math
 import random
+import signal
+import sys
 from datetime import timedelta
 
 # All necessary imports are now included above
@@ -54,6 +56,11 @@ from nl_probes.utils.dataset_utils import (
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses, parse_answer
+from nl_probes.utils.checkpointing import (
+    capture_rng_state,
+    load_checkpoint_if_exists,
+    save_checkpoint,
+)
 
 
 def push_lora_to_hf(
@@ -204,6 +211,7 @@ def train_features_batch(
     submodule: torch.nn.Module,
     device: torch.device,
     dtype: torch.dtype,
+    projection_module: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """
     Trains the model on a single batch of data.
@@ -219,6 +227,7 @@ def train_features_batch(
         steering_coefficient=cfg.steering_coefficient,
         device=device,
         dtype=dtype,
+        projection_module=projection_module,
     )
 
     tokenized_input = {
@@ -243,6 +252,7 @@ def eval_all_datasets(
     device: torch.device,
     dtype: torch.dtype,
     global_step: int,
+    projection_module: torch.nn.Module | None = None,
 ) -> None:
     model.eval()
     eval_results = {}
@@ -261,8 +271,10 @@ def eval_all_datasets(
             eval_batch_size=cfg.eval_batch_size,
             steering_coefficient=cfg.steering_coefficient,
             generation_kwargs=cfg.generation_kwargs,
+            projection_module=projection_module,
         )
         
+        """
         # DEBUG: Show oracle vs model responses
         if len(eval_responses) > 0 and len(eval_datasets[ds]) > 0:
             print(f"\n=== DEBUG EVAL {ds} at step {global_step} ===")
@@ -275,7 +287,8 @@ def eval_all_datasets(
                 print(f"  Parsed oracle: '{parse_answer(oracle_target)}'")
                 print(f"  Parsed model: '{parse_answer(model_response)}'")
             print("=" * 50)
-        
+        """
+
         percent_format_correct, percent_ans_correct = score_eval_responses(eval_responses, eval_datasets[ds])
         eval_results[f"eval_format_correct/{ds}"] = percent_format_correct
         eval_results[f"eval_ans_correct/{ds}"] = percent_ans_correct
@@ -304,6 +317,7 @@ def oom_preflight_check(
     activation_model: AutoModelForCausalLM,
     device: torch.device,
     dtype: torch.dtype,
+    projection_module: torch.nn.Module | None = None,
 ) -> None:
     longest_prompt = max(training_data, key=lambda x: len(x.input_ids))
     long_prompts = [longest_prompt] * cfg.train_batch_size
@@ -313,7 +327,15 @@ def oom_preflight_check(
     dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     for _ in tqdm(range(3), desc="OOM preflight check"):
-        loss = train_features_batch(cfg, largest_possible_batch, model, submodule, device, dtype)
+        loss = train_features_batch(
+            cfg,
+            largest_possible_batch,
+            model,
+            submodule,
+            device,
+            dtype,
+            projection_module=projection_module,
+        )
         loss.backward()
         dummy_optimizer.step()
         dummy_optimizer.zero_grad()
@@ -326,181 +348,6 @@ def oom_preflight_check(
 
 
 
-
-
-
-import os
-import sys
-import tempfile
-import signal
-from pathlib import Path
-from typing import Any
-
-import torch
-import torch.distributed as dist
-from torch.nn.utils import clip_grad_norm_
-from tqdm import tqdm
-
-# -------------------- Checkpoint helpers --------------------
-def _atomic_save(obj: dict, path: str):
-    """Save atomically to avoid partial files being picked up as checkpoints."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
-    os.close(tmp_fd)
-    try:
-        torch.save(obj, tmp_path)
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def find_latest_checkpoint(save_dir: str):
-    """Find the latest checkpoint by step or epoch. Returns path or None."""
-    p = Path(save_dir)
-    if not p.exists():
-        return None
-    step_ckpts = sorted(p.glob("checkpoint_step_*.pth"), key=lambda x: x.stat().st_mtime)
-    epoch_ckpts = sorted(p.glob("checkpoint_epoch_*.pth"), key=lambda x: x.stat().st_mtime)
-    if step_ckpts:
-        return str(step_ckpts[-1])
-    if epoch_ckpts:
-        return str(epoch_ckpts[-1])
-    return None
-
-from pickle import UnpicklingError
-
-def save_checkpoint(
-    save_dir: str,
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer | None,
-    scheduler: Any | None,
-    global_step: int,
-    epoch: int,
-    rng_state: dict | None = None,
-    extra: dict | None = None,
-    tag: str = "step",
-):
-    """
-    Save a checkpoint (only rank 0 should write the file contents).
-    - tag: "step" or "epoch" used in filename.
-    """
-    os.makedirs(save_dir, exist_ok=True)
-    filename = f"checkpoint_{tag}_{global_step if tag == 'step' else epoch}.pth"
-    path = os.path.join(save_dir, filename)
-
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
-        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-        "global_step": global_step,
-        "epoch": epoch,
-        "extra": extra or {},
-    }
-    if rng_state is not None:
-        ckpt["rng_state"] = rng_state
-
-    # Use atomic save helper if you have one; otherwise fallback to torch.save
-    try:
-        _atomic_save(ckpt, path)  # keep your existing atomic save if available
-    except NameError:
-        torch.save(ckpt, path)
-    return path
-
-
-def load_checkpoint_if_exists(save_dir: str, model: torch.nn.Module, optimizer=None, scheduler=None):
-    """
-    If a checkpoint exists in save_dir, load it and return (global_step, epoch).
-    Only call this after model/optimizer/scheduler are created and moved to device.
-
-    This function is robust to PyTorch 2.6+ behavior where torch.load defaults to
-    weights_only=True and to the "safe globals" restriction for some numpy objects.
-    """
-    ckpt_path = find_latest_checkpoint(save_dir)
-    if ckpt_path is None:
-        return None, None
-
-    # Try loading in a few ways to handle PyTorch 2.6+ weights_only default and
-    # the safe-globals restriction for numpy reconstruction.
-    ckpt = None
-    load_kwargs = {"map_location": "cpu"}
-
-    # First attempt: default torch.load (works on older PyTorch or if file is weights-only)
-    try:
-        ckpt = torch.load(ckpt_path, **load_kwargs)
-    except UnpicklingError:
-        # PyTorch 2.6+ may have attempted weights-only load and failed; retry allowing full unpickling.
-        try:
-            ckpt = torch.load(ckpt_path, **{**load_kwargs, "weights_only": False})
-        except TypeError:
-            # Older torch versions may not accept weights_only argument; re-raise original
-            raise
-    except Exception as e:
-        # If error mentions numpy.core.multiarray._reconstruct, try allowlisting that global
-        msg = str(e)
-        if "numpy.core.multiarray._reconstruct" in msg or "WeightsUnpickler error" in msg:
-            try:
-                import numpy as np
-                from torch.serialization import add_safe_globals
-
-                # Allowlist numpy's reconstruct function and retry with full unpickling.
-                add_safe_globals([np.core.multiarray._reconstruct])
-                ckpt = torch.load(ckpt_path, **{**load_kwargs, "weights_only": False})
-            except Exception:
-                # If that still fails, re-raise the original exception for visibility.
-                raise
-        else:
-            raise
-
-    if ckpt is None:
-        raise RuntimeError(f"Failed to load checkpoint from {ckpt_path}")
-
-    # Load model (allow missing keys if shapes differ; adjust strict as needed)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-
-    # Load optimizer and scheduler if present
-    if optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        except Exception:
-            # best-effort: ignore optimizer restore failures
-            pass
-    if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:
-        try:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        except Exception:
-            pass
-
-    # Restore RNG state if present
-    if "rng_state" in ckpt:
-        rng = ckpt["rng_state"]
-        if "torch" in rng:
-            torch.set_rng_state(rng["torch"])
-        if "cuda" in rng and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng["cuda"])
-        if "python" in rng:
-            import random
-            random.setstate(rng["python"])
-        if "numpy" in rng:
-            import numpy as np
-            np.random.set_state(rng["numpy"])
-
-    return int(ckpt.get("global_step", 0)), int(ckpt.get("epoch", 0))
-
-
-def capture_rng_state():
-    """Capture RNG state for reproducibility in checkpoint."""
-    state = {"torch": torch.get_rng_state()}
-    if torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    try:
-        import random, numpy as np  # type: ignore
-
-        state["python"] = random.getstate()
-        state["numpy"] = np.random.get_state()
-    except Exception:
-        pass
-    return state
 
 
 
@@ -560,6 +407,29 @@ def train_model(
         activation_model = load_model(cfg.target_model_name, dtype, **model_kwargs)
         activation_model.eval()
 
+    target_width = activation_model.config.hidden_size
+    oracle_width = model.config.hidden_size
+    activation_projector: torch.nn.Module | None = None
+    if target_width != oracle_width:
+        activation_projector = torch.nn.Linear(
+            target_width,
+            oracle_width,
+            bias=cfg.activation_projection_bias,
+            device=device,
+            dtype=dtype,
+        )
+        if rank == 0:
+            print(
+                "Hidden-size mismatch detected between target activations and oracle residual stream. "
+                f"Auto-enabling learned projection: target={cfg.target_model_name} ({target_width}) -> "
+                f"oracle={cfg.oracle_model_name} ({oracle_width}), bias={cfg.activation_projection_bias}."
+            )
+    elif cfg.use_learned_activation_projection and rank == 0:
+        print(
+            "use_learned_activation_projection is set but hidden sizes already match "
+            f"({target_width}); projection is not needed and will not be used."
+        )
+
     model.enable_input_require_grads()
 
     if cfg.gradient_checkpointing:
@@ -618,11 +488,15 @@ def train_model(
         activation_model,
         device,
         dtype,
+        projection_module=activation_projector,
     )
 
     set_seed(cfg.seed)
 
-    optimizer = torch.optim.AdamW(train_model_module.parameters(), lr=cfg.lr)
+    optimizer_params = list(train_model_module.parameters())
+    if activation_projector is not None:
+        optimizer_params.extend(activation_projector.parameters())
+    optimizer = torch.optim.AdamW(optimizer_params, lr=cfg.lr)
 
     global_step_size = cfg.train_batch_size * world_size
     effective_steps = (len(training_data) // global_step_size) * global_step_size
@@ -666,7 +540,14 @@ def train_model(
     global_step = 0
     start_epoch = 0
 
-    ckpt_global_step, ckpt_epoch = load_checkpoint_if_exists(cfg.save_dir, model, optimizer=optimizer, scheduler=scheduler)
+    modules_to_restore = {"activation_projector": activation_projector} if activation_projector is not None else None
+    ckpt_global_step, ckpt_epoch = load_checkpoint_if_exists(
+        cfg.save_dir,
+        model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        modules_to_restore=modules_to_restore,
+    )
     if ckpt_global_step is not None:
         global_step = ckpt_global_step
         start_epoch = ckpt_epoch
@@ -695,6 +576,11 @@ def train_model(
                     rng_state=rng,
                     extra={"signal": signum},
                     tag="step",
+                    module_states=(
+                        {"activation_projector": activation_projector.state_dict()}
+                        if activation_projector is not None
+                        else None
+                    ),
                 )
             dist.barrier()
         except Exception as e:
@@ -716,6 +602,7 @@ def train_model(
         wandb.summary["train/total_tokens_est"] = total_training_tokens_est
         wandb.summary["train/num_examples_pre_shard"] = num_examples_pre_shard
         
+        """
         # DEBUG: Show training data examples at start
         print(f"\n=== DEBUG TRAINING DATA at step {global_step} ===")
         for i in range(min(3, len(training_data))):
@@ -734,6 +621,7 @@ def train_model(
                 print(f"  DEBUG: Context positions: {data_point.context_positions[:5]}")
                 print(f"  DEBUG: Input_ids length: {len(data_point.input_ids)}")
         print("=" * 50)
+        """
 
     # If resuming, compute starting epoch and how many updates were done in that epoch
     resumed_updates = global_step
@@ -748,7 +636,21 @@ def train_model(
         if getattr(cfg, "save_epoch_interval", None) and (epoch % cfg.save_epoch_interval == 0) and epoch != start_epoch:
             if rank == 0:
                 rng = capture_rng_state()
-                save_checkpoint(cfg.save_dir, model, optimizer, scheduler, global_step, epoch, rng_state=rng, tag="epoch")
+                save_checkpoint(
+                    cfg.save_dir,
+                    model,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    epoch,
+                    rng_state=rng,
+                    tag="epoch",
+                    module_states=(
+                        {"activation_projector": activation_projector.state_dict()}
+                        if activation_projector is not None
+                        else None
+                    ),
+                )
             dist.barrier()
 
         updates_done_in_epoch = 0
@@ -773,7 +675,15 @@ def train_model(
             t_batch_list = materialize_missing_steering_vectors(t_batch_list, activation_tokenizer, activation_model)
             t_batch = construct_batch(t_batch_list, tokenizer, device)
 
-            loss = train_features_batch(cfg, t_batch, train_model_module, submodule, device, dtype)
+            loss = train_features_batch(
+                cfg,
+                t_batch,
+                train_model_module,
+                submodule,
+                device,
+                dtype,
+                projection_module=activation_projector,
+            )
             loss = loss / cfg.gradient_accumulation_steps
             loss.backward()
             accumulated_loss += loss.item()
@@ -810,6 +720,7 @@ def train_model(
                             device,
                             dtype,
                             global_step,
+                            projection_module=activation_projector,
                         )
                     dist.barrier()
 
@@ -817,7 +728,21 @@ def train_model(
                 if getattr(cfg, "save_steps", None) and (global_step % cfg.save_steps == 0) and global_step > 0:
                     if rank == 0:
                         rng = capture_rng_state()
-                        ckpt_path = save_checkpoint(cfg.save_dir, model, optimizer, scheduler, global_step, epoch, rng_state=rng, tag="step")
+                        ckpt_path = save_checkpoint(
+                            cfg.save_dir,
+                            model,
+                            optimizer,
+                            scheduler,
+                            global_step,
+                            epoch,
+                            rng_state=rng,
+                            tag="step",
+                            module_states=(
+                                {"activation_projector": activation_projector.state_dict()}
+                                if activation_projector is not None
+                                else None
+                            ),
+                        )
                         if verbose:
                             print(f"Saved checkpoint at {ckpt_path}")
                     dist.barrier()
@@ -829,7 +754,21 @@ def train_model(
         if getattr(cfg, "save_epoch_interval", None) and ((epoch + 1) % cfg.save_epoch_interval == 0):
             if rank == 0:
                 rng = capture_rng_state()
-                ckpt_path = save_checkpoint(cfg.save_dir, model, optimizer, scheduler, global_step, epoch + 1, rng_state=rng, tag="epoch")
+                ckpt_path = save_checkpoint(
+                    cfg.save_dir,
+                    model,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    epoch + 1,
+                    rng_state=rng,
+                    tag="epoch",
+                    module_states=(
+                        {"activation_projector": activation_projector.state_dict()}
+                        if activation_projector is not None
+                        else None
+                    ),
+                )
                 if verbose:
                     print(f"Saved epoch checkpoint at {ckpt_path}")
             dist.barrier()
@@ -852,6 +791,7 @@ def train_model(
             device,
             dtype,
             global_step,
+            projection_module=activation_projector,
         )
         wandb.finish()
 
@@ -887,15 +827,15 @@ def build_datasets(
     for dataset_loader in dataset_loaders:
         if "train" in dataset_loader.dataset_config.splits:
             train_data = dataset_loader.load_dataset("train")
-            print(f"DEBUG: Loaded {len(train_data)} items from {dataset_loader.dataset_config.dataset_name}")
+            # print(f"DEBUG: Loaded {len(train_data)} items from {dataset_loader.dataset_config.dataset_name}")
             if len(train_data) > 0:
                 sample = train_data[0]
-                print(f"DEBUG: Sample target_output: {repr(sample.target_output[:100] if hasattr(sample, 'target_output') else 'no target')}")
-                print(f"DEBUG: Sample context_input_ids length: {len(sample.context_input_ids) if hasattr(sample, 'context_input_ids') else 'no context'}")
+                # print(f"DEBUG: Sample target_output: {repr(sample.target_output[:100] if hasattr(sample, 'target_output') else 'no target')}")
+                # print(f"DEBUG: Sample context_input_ids length: {len(sample.context_input_ids) if hasattr(sample, 'context_input_ids') else 'no context'}")
             all_training_data.extend(train_data)
         if "test" in dataset_loader.dataset_config.splits:
             test_data = dataset_loader.load_dataset("test")
-            print(f"DEBUG: Loaded {len(test_data)} test items from {dataset_loader.dataset_config.dataset_name}")
+            # print(f"DEBUG: Loaded {len(test_data)} test items from {dataset_loader.dataset_config.dataset_name}")
             all_eval_data[dataset_loader.dataset_config.dataset_name] = test_data
 
     p = max_len_percentile
@@ -1272,7 +1212,7 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 4
+    train_batch_size = 16
     gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
@@ -1293,7 +1233,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 4
+    gradient_accumulation_steps = 1
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(
@@ -1355,6 +1295,7 @@ if __name__ == "__main__":
 
         tokenizer = load_tokenizer(cfg.oracle_model_name)  # Use oracle tokenizer for train/eval model inputs
         
+        """
         # DEBUG: Test oracle tokenizer behavior
         if local_rank == 0:
             print(f"\n=== Using Oracle Tokenizer {cfg.oracle_model_name} for Training ===")
@@ -1365,6 +1306,7 @@ if __name__ == "__main__":
             print(f'"Yes" decoded: "{tokenizer.decode(test_yes)}"')
             print(f'"No" decoded: "{tokenizer.decode(test_no)}"')
             print("=" * 50)
+        """
 
         # Ensure only rank 0 performs any on-disk dataset creation
         if local_rank == 0:

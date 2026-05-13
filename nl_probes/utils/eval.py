@@ -28,6 +28,7 @@ def eval_features_batch(
     dtype: torch.dtype,
     steering_coefficient: float,
     generation_kwargs: dict,
+    projection_module: torch.nn.Module | None = None,
 ) -> list[FeatureResult]:
     batch_steering_vectors = eval_batch.steering_vectors
     batch_positions = eval_batch.positions
@@ -39,6 +40,7 @@ def eval_features_batch(
         steering_coefficient=steering_coefficient,
         device=device,
         dtype=dtype,
+        projection_module=projection_module,
     )
 
     tokenized_input = {
@@ -112,6 +114,7 @@ def run_evaluation(
     activation_tokenizer: PreTrainedTokenizer | None = None,
     activation_model: AutoModelForCausalLM | None = None,
     verbose: bool = False,
+    projection_module: torch.nn.Module | None = None,
 ) -> list[FeatureResult]:
     """Run evaluation and save results."""
     if activation_tokenizer is None:
@@ -147,6 +150,7 @@ def run_evaluation(
                 dtype=dtype,
                 steering_coefficient=steering_coefficient,
                 generation_kwargs=generation_kwargs,
+                projection_module=projection_module,
             )
             if verbose:
                 for feature_result in feature_results:

@@ -132,6 +132,7 @@ def get_hf_activation_steering_hook(
     steering_coefficient: float,
     device: torch.device,
     dtype: torch.dtype,
+    projection_module: torch.nn.Module | None = None,
 ) -> Callable:
     """
     HF hook with debug prints to compare against vLLM.
@@ -186,7 +187,10 @@ def get_hf_activation_steering_hook(
                     print(f"\n\n\n\n\nWARNING: Large norm detected in batch! {norms_K1}\n\n\n\n\n")
 
             # Build steered vectors for this b
-            steered_KD = (normed_list[b] *  norms_K1 * steering_coefficient).to(dtype)  # (K_b, d_oracle)
+            projected_normed = normed_list[b].to(device=device, dtype=dtype)
+            if projection_module is not None:
+                projected_normed = projection_module(projected_normed)
+            steered_KD = projected_normed * norms_K1 * steering_coefficient  # (K_b, d_oracle)
             
             if steered_KD.shape[-1] != orig_KD.shape[-1]:
                 raise ValueError(
@@ -195,7 +199,7 @@ def get_hf_activation_steering_hook(
                     "Cross-model runs with different hidden sizes require an explicit learned projection."
                 )
 
-            resid_BLD[b, pos_b, :] = steered_KD.detach() + orig_KD
+            resid_BLD[b, pos_b, :] = steered_KD + orig_KD
 
         return (resid_BLD, *rest) if output_is_tuple else resid_BLD
 
