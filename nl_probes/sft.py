@@ -1324,9 +1324,9 @@ if __name__ == "__main__":
         # eval_key = eval_keys[0]
         # all_eval_data = {eval_key: all_training_data[:]}
 
-        print(f"training data length: {len(all_training_data)}, eval data length: {len(all_eval_data)}")
+        # print(f"training data length: {len(all_training_data)}, eval data length: {len(all_eval_data)}")
 
-        print(asdict(cfg))
+        # print(asdict(cfg))
 
         train_model(
             cfg=cfg,
