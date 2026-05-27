@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import VerbalizerInputInfo, VerbalizerResults
+from nl_probes.utils.lora_utils import secret_targets_gender
 from nl_probes.utils.common import load_model, load_tokenizer
 
 if __name__ == "__main__":
@@ -36,6 +37,7 @@ if __name__ == "__main__":
         "male",
         "female",
     ]
+    target_lora_path_by_suffix: dict[str, str] | None = None
 
     # IMPORTANT: Specify LoRAs for your base model here
     if model_name == "google/gemma-2-9b-it":
@@ -55,7 +57,18 @@ if __name__ == "__main__":
         ]
         target_lora_path_template = "bcywinski/gemma-2-9b-it-user-{lora_path}"
         segment_start = -10
-
+    elif model_name in ("Qwen/Qwen3-4B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3.5-4B"):
+        rows = secret_targets_gender(model_name)
+        if not rows:
+            raise ValueError(
+                f"No gender target LoRAs on Hugging Face for {model_name} "
+                "(paper uses gemma-2-9b-it-user-{{male,female}} only)."
+            )
+        verbalizer_lora_paths = [None]
+        target_lora_suffixes = [r["suffix"] for r in rows]
+        target_lora_path_by_suffix = {r["suffix"]: r["lora_hf_or_local"] for r in rows}
+        target_lora_path_template = None
+        segment_start = -10
     else:
         raise ValueError(f"Unsupported MODEL_NAME: {model_name}")
 
@@ -150,7 +163,10 @@ if __name__ == "__main__":
         for target_lora_suffix in target_lora_suffixes:
             target_lora_path = None
             if target_lora_suffix is not None:
-                target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
+                if target_lora_path_by_suffix is not None:
+                    target_lora_path = target_lora_path_by_suffix[target_lora_suffix]
+                else:
+                    target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
 
             sanitized_target_name = None
             if target_lora_path is not None:

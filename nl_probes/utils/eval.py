@@ -6,6 +6,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
 import torch._dynamo as dynamo
 
+from nl_probes.utils.lora_utils import sanitize_lora_name
 from nl_probes.utils.steering_hooks import add_hook, get_hf_activation_steering_hook
 from nl_probes.utils.dataset_utils import (
     BatchData,
@@ -122,7 +123,7 @@ def run_evaluation(
     if activation_model is None:
         activation_model = model
     if lora_path is not None:
-        adapter_name = lora_path
+        adapter_name = sanitize_lora_name(lora_path)
         if adapter_name not in model.peft_config:
             model.load_adapter(lora_path, adapter_name=adapter_name, is_trainable=False, low_cpu_mem_usage=True)
         model.set_adapter(adapter_name)

@@ -23,6 +23,7 @@ from nl_probes.utils.activation_utils import collect_activations_multiple_layers
 from nl_probes.utils.common import load_model, load_tokenizer, layer_percent_to_layer
 from nl_probes.utils.dataset_utils import TrainingDataPoint, create_training_datapoint
 from nl_probes.utils.eval import run_evaluation
+from nl_probes.utils.lora_utils import sanitize_lora_name
 
 
 # ========================================
@@ -281,10 +282,6 @@ def create_verbalizer_inputs(
     return training_data
 
 
-def sanitize_lora_name(lora_path: str) -> str:
-    return lora_path.replace(".", "_")
-
-
 def collect_target_responses(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -294,7 +291,7 @@ def collect_target_responses(
     device: torch.device,
 ) -> list[list[dict[str, str]]]:
     if target_lora_path is not None:
-        model.set_adapter(target_lora_path)
+        model.set_adapter(sanitize_lora_name(target_lora_path))
     new_messages: list[list[dict[str, str]]] = []
 
     for i in range(0, len(context_prompts), config.eval_batch_size):
@@ -331,7 +328,8 @@ def collect_target_activations(
     if "lora" in config.activation_input_types:
         model.enable_adapters()
         if target_lora_path is not None:
-            model.set_adapter(target_lora_path)
+            load_lora_adapter(model, target_lora_path)
+            model.set_adapter(sanitize_lora_name(target_lora_path))
         else:
             print("\n\n\n\nWarning: target_lora_path is None, collecting lora activations from base model")
         # setting submodules after setting the adapter - I don't think this matters but I'm paranoid
@@ -493,7 +491,8 @@ def run_verbalizer(
                 )
 
         if verbalizer_lora_path is not None:
-            model.set_adapter(verbalizer_lora_path)
+            load_lora_adapter(model, verbalizer_lora_path)
+            model.set_adapter(sanitize_lora_name(verbalizer_lora_path))
 
         # Run evaluation once for the giant batch
         responses = run_evaluation(
@@ -579,7 +578,7 @@ def run_verbalizer(
 def load_lora_adapter(model: AutoModelForCausalLM, lora_path: str) -> str:
     sanitized_lora_name = sanitize_lora_name(lora_path)
 
-    if sanitized_lora_name not in model.peft_config:
+    if not hasattr(model, "peft_config") or sanitized_lora_name not in model.peft_config:
         print(f"Loading LoRA: {lora_path}")
         model.load_adapter(
             lora_path,

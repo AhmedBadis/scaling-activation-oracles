@@ -17,6 +17,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import VerbalizerInputInfo, VerbalizerResults
+from nl_probes.utils.lora_utils import TABOO_SUFFIXES, secret_targets_taboo
 from nl_probes.utils.common import load_model, load_tokenizer
 
 if __name__ == "__main__":
@@ -35,29 +36,8 @@ if __name__ == "__main__":
 
     # By default we iterate over target_loras and verbalizer_loras
     # target_lora can also be set to None when calling run_verbalizer() to get base model activations
-    target_lora_suffixes = [
-        "ship",
-        "wave",
-        "song",
-        "snow",
-        "rock",
-        "moon",
-        "jump",
-        "green",
-        "flame",
-        "flag",
-        "dance",
-        "cloud",
-        "clock",
-        "chair",
-        "salt",
-        "book",
-        "blue",
-        # "adversarial",
-        "gold",
-        "leaf",
-        "smile",
-    ]
+    target_lora_suffixes = TABOO_SUFFIXES
+    target_lora_path_by_suffix: dict[str, str] | None = None
 
     if model_name == "Qwen/Qwen3-8B":
         verbalizer_lora_paths = [
@@ -85,6 +65,16 @@ if __name__ == "__main__":
             # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-4",
         ]
         target_lora_path_template: Optional[str] = "bcywinski/gemma-2-9b-it-taboo-{lora_path}"
+        segment_start = -10
+    elif model_name in ("Qwen/Qwen3-4B", "Qwen/Qwen3-1.7B"):
+        verbalizer_lora_paths = [None]
+        rows = secret_targets_taboo(model_name)
+        if not rows:
+            raise ValueError(f"No taboo target LoRAs configured for {model_name}")
+        target_lora_suffixes = [r["suffix"] for r in rows]
+        # Per-suffix Hub path (templates differ between 4B and 1.7B).
+        target_lora_path_by_suffix = {r["suffix"]: r["lora_hf_or_local"] for r in rows}
+        target_lora_path_template: Optional[str] = None
         segment_start = -10
     else:
         raise ValueError(f"Unsupported MODEL_NAME: {model_name}")
@@ -189,7 +179,10 @@ if __name__ == "__main__":
         for target_lora_suffix in target_lora_suffixes:
             target_lora_path = None
             if target_lora_suffix is not None:
-                target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
+                if target_lora_path_by_suffix is not None:
+                    target_lora_path = target_lora_path_by_suffix[target_lora_suffix]
+                else:
+                    target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
 
             sanitized_target_name = None
             if target_lora_path is not None:

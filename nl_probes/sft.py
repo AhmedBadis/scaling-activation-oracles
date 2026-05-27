@@ -47,6 +47,7 @@ from nl_probes.dataset_classes.sae_training_data import (
 )
 from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets
 from nl_probes.utils.common import load_model, load_tokenizer, set_seed
+from nl_probes.utils.hf_config import gradient_checkpointing_same_pretrained_family
 from nl_probes.utils.dataset_utils import (
     BatchData,
     EvalStepResult,
@@ -267,7 +268,7 @@ def eval_all_datasets(
             device=device,
             dtype=dtype,
             global_step=global_step,
-            lora_path=cfg.load_lora_path,
+            lora_path=None,
             eval_batch_size=cfg.eval_batch_size,
             steering_coefficient=cfg.steering_coefficient,
             generation_kwargs=cfg.generation_kwargs,
@@ -381,6 +382,9 @@ def train_model(
     dtype: torch.dtype,
     model_kwargs: dict[str, Any],
     verbose: bool = False,
+    save_checkpoint_on_complete: bool = False,
+    checkpoint_complete_extra: dict[str, Any] | None = None,
+    dual_target_phase_label: str | None = None,
 ):
     """
     Training loop with:
@@ -388,6 +392,15 @@ def train_model(
       - checkpoint on update steps every cfg.save_steps,
       - checkpoint on epoch boundaries every cfg.save_epoch_interval,
       - signal handlers for SIGTERM and SIGUSR1 to trigger immediate checkpoint.
+
+    ``save_checkpoint_on_complete`` (dual-target training only): write a step checkpoint when this
+    call's training slice finishes, so the next phase resumes from the phase boundary rather than
+    the last periodic ``save_steps`` checkpoint mid-slice.
+
+    ``dual_target_phase_label`` (dual-target only): cumulative ``global_step`` continues across
+    phases, but batch skipping uses per-phase progress (see checkpoint ``extra``). Without this,
+    ``global_step // steps_per_epoch`` can skip the entire training loop when resuming a completed
+  phase slice.
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -541,18 +554,61 @@ def train_model(
     start_epoch = 0
 
     modules_to_restore = {"activation_projector": activation_projector} if activation_projector is not None else None
-    ckpt_global_step, ckpt_epoch = load_checkpoint_if_exists(
+    ckpt_global_step, ckpt_epoch, ckpt_extra = load_checkpoint_if_exists(
         cfg.save_dir,
         model,
         optimizer=optimizer,
         scheduler=scheduler,
         modules_to_restore=modules_to_restore,
     )
+    phase_start_global_step = 0
+    updates_done_in_epoch = 0
     if ckpt_global_step is not None:
         global_step = ckpt_global_step
         start_epoch = ckpt_epoch
         if rank == 0:
             print(f"Resuming from checkpoint: global_step={global_step}, epoch={start_epoch}")
+    if dual_target_phase_label:
+        start_epoch = 0
+        phase_slice_complete = False
+        if ckpt_global_step is not None:
+            ckpt_phase = ckpt_extra.get("dual_target_phase")
+            ckpt_phase_start = int(ckpt_extra.get("dual_target_phase_start_global_step", 0))
+            phase_complete_flag = bool(ckpt_extra.get("dual_target_phase_complete", False))
+            if ckpt_phase == dual_target_phase_label:
+                phase_start_global_step = ckpt_phase_start
+                updates_done_in_epoch = global_step - phase_start_global_step
+                phase_slice_complete = phase_complete_flag or updates_done_in_epoch >= steps_per_epoch
+                if phase_slice_complete:
+                    updates_done_in_epoch = steps_per_epoch
+            else:
+                phase_start_global_step = global_step
+                updates_done_in_epoch = 0
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=total_training_steps,
+                )
+        else:
+            phase_start_global_step = 0
+            updates_done_in_epoch = 0
+        if rank == 0:
+            print(
+                f"Dual-target phase {dual_target_phase_label}: "
+                f"phase_start_global_step={phase_start_global_step} "
+                f"updates_done_in_this_slice={updates_done_in_epoch} "
+                f"steps_per_epoch={steps_per_epoch} "
+                f"phase_slice_complete={phase_slice_complete}"
+            )
+
+    def _dual_target_ckpt_extra() -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "dual_target_phase": dual_target_phase_label,
+            "dual_target_phase_start_global_step": phase_start_global_step,
+        }
+        if checkpoint_complete_extra:
+            out.update(checkpoint_complete_extra)
+        return out
 
     # Re-wrap with DDP to ensure correct device mapping after loading weights
     train_model_module = torch.nn.parallel.DistributedDataParallel(
@@ -574,7 +630,7 @@ def train_model(
                     global_step,
                     start_epoch,
                     rng_state=rng,
-                    extra={"signal": signum},
+                    extra=_dual_target_ckpt_extra() if dual_target_phase_label else {"signal": signum},
                     tag="step",
                     module_states=(
                         {"activation_projector": activation_projector.state_dict()}
@@ -623,10 +679,13 @@ def train_model(
         print("=" * 50)
         """
 
-    # If resuming, compute starting epoch and how many updates were done in that epoch
-    resumed_updates = global_step
-    if resumed_updates > 0:
-        start_epoch = resumed_updates // steps_per_epoch
+    if not dual_target_phase_label:
+        resumed_updates = global_step
+        if resumed_updates > 0:
+            start_epoch = resumed_updates // steps_per_epoch
+        if start_epoch == cfg.num_epochs:
+            start_epoch = cfg.num_epochs - 1
+            updates_done_in_epoch = steps_per_epoch
 
     for epoch in range(start_epoch, cfg.num_epochs):
         accumulated_loss = 0.0
@@ -653,9 +712,10 @@ def train_model(
                 )
             dist.barrier()
 
-        updates_done_in_epoch = 0
-        if epoch == start_epoch and resumed_updates > 0:
-            updates_done_in_epoch = resumed_updates % steps_per_epoch
+        if not dual_target_phase_label:
+            updates_done_in_epoch = 0
+            if epoch == start_epoch and global_step > 0:
+                updates_done_in_epoch = global_step % steps_per_epoch
 
         batch_range = range(0, len(training_data), cfg.train_batch_size)
         batches_to_skip = updates_done_in_epoch * cfg.gradient_accumulation_steps if updates_done_in_epoch > 0 else 0
@@ -736,6 +796,7 @@ def train_model(
                             global_step,
                             epoch,
                             rng_state=rng,
+                            extra=_dual_target_ckpt_extra() if dual_target_phase_label else None,
                             tag="step",
                             module_states=(
                                 {"activation_projector": activation_projector.state_dict()}
@@ -772,6 +833,31 @@ def train_model(
                 if verbose:
                     print(f"Saved epoch checkpoint at {ckpt_path}")
             dist.barrier()
+
+    if save_checkpoint_on_complete:
+        if rank == 0:
+            rng = capture_rng_state()
+            extra = _dual_target_ckpt_extra() if dual_target_phase_label else {"dual_target_phase_complete": True}
+            if not dual_target_phase_label and checkpoint_complete_extra:
+                extra.update(checkpoint_complete_extra)
+            ckpt_path = save_checkpoint(
+                cfg.save_dir,
+                model,
+                optimizer,
+                scheduler,
+                global_step,
+                epoch,
+                rng_state=rng,
+                tag="step",
+                extra=extra,
+                module_states=(
+                    {"activation_projector": activation_projector.state_dict()}
+                    if activation_projector is not None
+                    else None
+                ),
+            )
+            print(f"Saved phase-boundary checkpoint at {ckpt_path} (global_step={global_step})")
+        dist.barrier()
 
     # Finalize
     if rank == 0:
@@ -923,7 +1009,7 @@ def build_loader_groups(
             prompt_model_name=prompt_model_name,
             layer_percents=layer_percents,
             save_acts=save_acts,
-            batch_size=train_batch_size,
+            batch_size=act_collection_batch_size,
         )
     )
 
@@ -940,7 +1026,7 @@ def build_loader_groups(
             prompt_model_name=prompt_model_name,
             layer_percents=layer_percents,
             save_acts=save_acts,
-            batch_size=train_batch_size,
+            batch_size=act_collection_batch_size,
         )
     )
 
@@ -954,7 +1040,7 @@ def build_loader_groups(
             prompt_model_name=prompt_model_name,
             layer_percents=layer_percents,
             save_acts=False,
-            batch_size=train_batch_size,
+            batch_size=act_collection_batch_size,
         )
     )
 
@@ -1042,7 +1128,7 @@ def build_loader_groups(
         if "batch_size" in meta:
             bs = meta["batch_size"]
         else:
-            bs = train_batch_size
+            bs = act_collection_batch_size
 
         classification_loaders.append(
             ClassificationDatasetLoader(
@@ -1072,7 +1158,7 @@ def build_loader_groups(
                     prompt_model_name=prompt_model_name,
                     layer_percents=layer_percents,
                     save_acts=save_acts,
-                    batch_size=train_batch_size,
+                    batch_size=act_collection_batch_size,
                 ),
                 model_kwargs=model_kwargs,
             )
@@ -1213,7 +1299,16 @@ if __name__ == "__main__":
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
     train_batch_size = 16
-    gradient_checkpointing = False
+    gradient_checkpointing = gradient_checkpointing_same_pretrained_family(
+        cfg.oracle_model_name, cfg.target_model_name
+    )
+    if local_rank == 0:
+        print(
+            "gradient_checkpointing: "
+            f"{gradient_checkpointing} "
+            f"(on when oracle and target share the same HF config model_type; "
+            f"{cfg.oracle_model_name!r} vs {cfg.target_model_name!r})"
+        )
     model_kwargs = {"attn_implementation": "sdpa"}
 
     if target_model_name == "Qwen/Qwen3-32B" or target_model_name == "meta-llama/Llama-3.3-70B-Instruct":

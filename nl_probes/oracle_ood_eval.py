@@ -1,28 +1,20 @@
 """
-Single-file driver for **out-of-training** evaluations (taboo, gender, SSC, personaqa, classification).
+One-file **out-of-training secret-keeping** sweep (paper-style OOD audits).
 
-Edit the tables at the bottom of this file (or set ``ORACLE_OOD_CONFIG`` to a JSON file path whose
-schema matches the ``_manifest_from_json`` structure). Then::
+Runs the same benchmarks as ``experiments/taboo_open_ended_eval.py``, ``gender_open_ended_eval.py``,
+``ssc_open_ended_eval.py``, and ``personaqa_open_ended_eval.py`` (datasets + verbalizer prompts), but
+scores **your** trained oracle LoRAs from the thesis manifest. Does **not** run classification (that
+mixture is already in ``train.sbatch`` / ``nl_probes/sft.py``).
+
+Target-side LoRA IDs come from ``nl_probes.utils.lora_utils`` (thesis Qwen activation bases only:
+``Qwen/Qwen3-1.7B``, ``Qwen/Qwen3-4B``, ``Qwen/Qwen3.5-4B``). Evals with no published Hub LoRA for a
+base are **skipped** with ``reason=no_secret_targets_for_activation_model``.
+
+Default checkpoint paths are repo-relative. Run::
 
     sbatch runner/oracle_ood_eval.sbatch
 
-or::
-
-    python -m nl_probes.oracle_ood_eval
-
-Logs: lines prefixed with ``ORACLE_OOD_EVAL`` for easy ``grep`` in Slurm ``.out`` / ``.err``.
-
-**Mechanics**
-- **Same-base oracle and activation model** (e.g. Qwen3-4B oracle on Qwen3-4B taboo LoRAs): uses
-  ``nl_probes.base_experiment.run_verbalizer`` unchanged.
-- **Different activation base** (e.g. Qwen3-1.7B oracle reading Qwen3-4B activations): loads two
-  models, collects activations on the **target** stack, builds ``TrainingDataPoint`` rows via
-  ``create_verbalizer_inputs``, then calls ``nl_probes.utils.eval.run_evaluation`` on the oracle
-  with ``activation_tokenizer``, ``activation_model``, and an optional ``projection_module`` built
-  from the latest ``checkpoint_*.pth`` under ``projector_save_dir`` (``module_states["activation_projector"]``).
-
-**Classification** reuses the same dataset construction pattern as ``experiments/classification_eval.py``
-(without importing that module, because it runs a training grid at import time).
+Logs: grep ``ORACLE_OOD_EVAL`` in Slurm ``.out`` / ``.err``.
 """
 
 from __future__ import annotations
@@ -39,7 +31,7 @@ from typing import Any
 import torch
 from peft import LoraConfig
 from tqdm import tqdm
-from transformers import AutoConfig, BitsAndBytesConfig
+from transformers import BitsAndBytesConfig
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import (
@@ -48,13 +40,12 @@ from nl_probes.base_experiment import (
     create_verbalizer_inputs,
     encode_messages,
 )
-from nl_probes.dataset_classes.act_dataset_manager import DatasetLoaderConfig
-from nl_probes.dataset_classes.classification import ClassificationDatasetConfig, ClassificationDatasetLoader
 from nl_probes.utils.activation_utils import collect_activations_multiple_layers, get_hf_submodule
 from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.checkpointing import find_latest_checkpoint
 from nl_probes.utils.eval import run_evaluation
-from nl_probes.base_experiment import sanitize_lora_name
+from nl_probes.utils.lora_utils import secret_targets_for_eval
+from nl_probes.utils.hf_config import pretrained_hidden_size
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 _LOG = "ORACLE_OOD_EVAL"
@@ -64,122 +55,16 @@ def _banner(**parts: str) -> None:
     print(_LOG + " " + " ".join(f"{k}={v}" for k, v in sorted(parts.items())), flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Classification (mirrors ``experiments/classification_eval.py`` test setup)
-# ---------------------------------------------------------------------------
-_INJECTION_LAYER = 1
-_STEERING_COEFFICIENT = 1.0
-_GENERATION_KWARGS = {"do_sample": False, "temperature": 0.0, "max_new_tokens": 10}
-_SINGLE_TOKEN_MODE = True
-_MAIN_TEST_SIZE = 250
-_CLASSIFICATION_DATASETS: dict[str, dict[str, Any]] = {
-    "geometry_of_truth": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "relations": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "sst2": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "md_gender": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "snli": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "ag_news": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "ner": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "tense": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "language_identification": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-    "singular_plural": {"num_train": 0, "num_test": _MAIN_TEST_SIZE, "splits": ["test"]},
-}
-
-
-def _cls_get_model_kwargs(model_name: str) -> dict:
+def _get_model_kwargs(model_name: str) -> dict:
     if model_name == "meta-llama/Llama-3.3-70B-Instruct":
         bnb_config = BitsAndBytesConfig(load_in_8bit=True, bnb_8bit_compute_dtype=torch.bfloat16)
         return {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
     return {"attn_implementation": "sdpa"}
 
 
-def _cls_get_batch_size(model_name: str) -> int:
-    if model_name == "Qwen/Qwen3-32B":
-        return 64
-    return 256
-
-
-def _cls_load_eval_data(model_name: str, layer_percent: int, model_kwargs: dict, model) -> dict[str, list[Any]]:
-    batch_size = _cls_get_batch_size(model_name)
-    loaders: list[ClassificationDatasetLoader] = []
-    for dataset_name, dcfg in _CLASSIFICATION_DATASETS.items():
-        ds_batch_size = batch_size // 8 if "language_identification" in dataset_name else batch_size
-        if _SINGLE_TOKEN_MODE:
-            ccfg = ClassificationDatasetConfig(
-                classification_dataset_name=dataset_name,
-                max_end_offset=-3,
-                min_end_offset=-3,
-                max_window_size=1,
-                min_window_size=1,
-            )
-        else:
-            ccfg = ClassificationDatasetConfig(
-                classification_dataset_name=dataset_name,
-                max_end_offset=-1,
-                min_end_offset=-1,
-                max_window_size=50,
-                min_window_size=50,
-            )
-        dconf = DatasetLoaderConfig(
-            custom_dataset_params=ccfg,
-            num_train=dcfg["num_train"],
-            num_test=dcfg["num_test"],
-            splits=dcfg["splits"],
-            model_name=model_name,
-            layer_percents=[layer_percent],
-            save_acts=True,
-            batch_size=ds_batch_size,
-        )
-        loaders.append(ClassificationDatasetLoader(dataset_config=dconf, model_kwargs=model_kwargs, model=model))
-    out: dict[str, list[Any]] = {}
-    for loader in loaders:
-        if "test" in loader.dataset_config.splits:
-            name = loader.dataset_config.dataset_name
-            if name.startswith("classification_"):
-                name = name[len("classification_") :]
-            out[name] = loader.load_dataset("test")
-    return out
-
-
-def _cls_run(model, tokenizer, submodule, model_name: str, layer_percent: int, lora_path: str, eval_data: dict) -> dict:
-    sanitized = None
-    if lora_path:
-        sanitized = sanitize_lora_name(lora_path)
-        if sanitized not in model.peft_config:
-            model.load_adapter(lora_path, adapter_name=sanitized, is_trainable=False, low_cpu_mem_usage=True)
-        model.set_adapter(sanitized)
-    batch_size = _cls_get_batch_size(model_name)
-    meta = {
-        "model_name": model_name,
-        "layer_percent": layer_percent,
-        "lora_path": lora_path,
-        "eval_batch_size": batch_size,
-    }
-    records: list[dict] = []
-    for ds_id, ev in eval_data.items():
-        raw = run_evaluation(
-            eval_data=ev,
-            model=model,
-            tokenizer=tokenizer,
-            submodule=submodule,
-            device=torch.device("cuda"),
-            dtype=torch.bfloat16,
-            global_step=-1,
-            lora_path=sanitized,
-            eval_batch_size=batch_size,
-            steering_coefficient=_STEERING_COEFFICIENT,
-            generation_kwargs=_GENERATION_KWARGS,
-        )
-        for r, t in zip(raw, ev, strict=True):
-            records.append({"dataset_id": ds_id, "response": r.api_response, "target": t.target_output})
-    if sanitized is not None and sanitized in model.peft_config:
-        model.delete_adapter(sanitized)
-    return {"meta": meta, "records": records}
-
-
 def _load_projector(oracle_name: str, act_name: str, save_dir: str | None) -> torch.nn.Module | None:
-    ow = AutoConfig.from_pretrained(oracle_name).hidden_size
-    aw = AutoConfig.from_pretrained(act_name).hidden_size
+    ow = pretrained_hidden_size(oracle_name)
+    aw = pretrained_hidden_size(act_name)
     if ow == aw:
         return None
     if not save_dir:
@@ -232,7 +117,7 @@ def _run_secret_same_model(
     torch.set_grad_enabled(False)
     ve = _ve_config_for_activation_model(model_name, spec)
     tokenizer = load_tokenizer(model_name)
-    mk = _cls_get_model_kwargs(model_name)
+    mk = _get_model_kwargs(model_name)
     model = load_model(model_name, dtype, **mk)
     model.eval()
     model.add_adapter(LoraConfig(), adapter_name="default")
@@ -329,14 +214,12 @@ def _run_secret_cross_model(
     ve_act = _ve_config_for_activation_model(a_name, spec)
     o_tok = load_tokenizer(o_name)
     a_tok = load_tokenizer(a_name)
-    mk_o = _cls_get_model_kwargs(o_name)
-    mk_a = _cls_get_model_kwargs(a_name)
+    mk_o = _get_model_kwargs(o_name)
+    mk_a = _get_model_kwargs(a_name)
     o_model = load_model(o_name, dtype, **mk_o)
     a_model = load_model(a_name, dtype, **mk_a)
     o_model.eval()
     a_model.eval()
-    o_model.add_adapter(LoraConfig(), adapter_name="default")
-    a_model.add_adapter(LoraConfig(), adapter_name="default")
     o_sub = get_hf_submodule(o_model, ve_act.injection_layer)
     if eval_name == "personaqa":
         ctx_lines = []
@@ -490,24 +373,6 @@ def _run_secret_cross_model(
     torch.cuda.empty_cache()
 
 
-def _run_classification_for_oracle(oracle_row: dict, out_dir: Path, layer_percent: int) -> None:
-    name = oracle_row["oracle_model_name"]
-    verbal = oracle_row["verbalizer_lora"]
-    mk = _cls_get_model_kwargs(name)
-    tok = load_tokenizer(name)
-    model = load_model(name, torch.bfloat16, **mk)
-    model.add_adapter(LoraConfig(), adapter_name="default")
-    sub = get_hf_submodule(model, _INJECTION_LAYER)
-    ev = _cls_load_eval_data(name, layer_percent, mk, model)
-    res = _cls_run(model, tok, sub, name, layer_percent, verbal, ev)
-    p = out_dir / f"classification_lp{layer_percent}.json"
-    p.write_text(json.dumps(res, indent=2), encoding="utf-8")
-    _banner(oracle=oracle_row["id"], eval="classification", status="saved", path=str(p))
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def _manifest() -> tuple[list[dict], dict]:
     path = os.environ.get("ORACLE_OOD_CONFIG", "").strip()
     if path:
@@ -516,58 +381,72 @@ def _manifest() -> tuple[list[dict], dict]:
     return ORACLE_MANIFEST_DEFAULT, SECRET_EVALS_DEFAULT
 
 
+def _resolve_repo_checkpoint_path(p: str) -> str:
+    """Paths in the default manifest are repo-relative; Slurm ``cd`` is the repo root."""
+    if not p:
+        return p
+    if p.startswith("/"):
+        return p
+    return str(REPO_ROOT / p)
+
+
+def _normalize_manifest_rows(rows: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        r = dict(row)
+        if r.get("verbalizer_lora"):
+            r["verbalizer_lora"] = _resolve_repo_checkpoint_path(r["verbalizer_lora"])
+        if r.get("projector_save_dir"):
+            r["projector_save_dir"] = _resolve_repo_checkpoint_path(r["projector_save_dir"])
+        out.append(r)
+    return out
+
+
 # =============================================================================
 # EDIT BELOW (or use ORACLE_OOD_CONFIG JSON with keys ``oracles``, ``secret_evals``)
 # =============================================================================
 ORACLE_MANIFEST_DEFAULT: list[dict[str, Any]] = [
     {
-        "id": "o1.7-t4-identity",
-        "oracle_model_name": "Qwen/Qwen3-1.7B",
-        "activation_model_name": "Qwen/Qwen3-4B",
-        "verbalizer_lora": "",
-        "projector_save_dir": "",
-    },
-    {
         "id": "o1.7-t4-proj",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
         "activation_model_name": "Qwen/Qwen3-4B",
-        "verbalizer_lora": "",
-        "projector_save_dir": "",
+        "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3-4B/final",
+        "projector_save_dir": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3-4B",
     },
     {
         "id": "o1.7-t1.7",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
         "activation_model_name": "Qwen/Qwen3-1.7B",
-        "verbalizer_lora": "",
+        "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3-1.7B/final",
         "projector_save_dir": "",
+    },
+    {
+        "id": "o1.7-t3.5-4B",
+        "oracle_model_name": "Qwen/Qwen3-1.7B",
+        "activation_model_name": "Qwen/Qwen3.5-4B",
+        "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3.5-4B/final",
+        "projector_save_dir": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3.5-4B",
     },
     {
         "id": "o4-t4",
         "oracle_model_name": "Qwen/Qwen3-4B",
         "activation_model_name": "Qwen/Qwen3-4B",
-        "verbalizer_lora": "",
-        "projector_save_dir": "",
-    },
-    {
-        "id": "o4-t3.5-4B",
-        "oracle_model_name": "Qwen/Qwen3-4B",
-        "activation_model_name": "Qwen/Qwen3.5-4B",
-        "verbalizer_lora": "",
+        "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-4B_target_Qwen3-4B/final",
         "projector_save_dir": "",
     },
     {
         "id": "O3.5-t3-4B",
         "oracle_model_name": "Qwen/Qwen3.5-4B",
         "activation_model_name": "Qwen/Qwen3-4B",
-        "verbalizer_lora": "",
-        "projector_save_dir": "",
+        "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3.5-4B_target_Qwen3-4B/final",
+        "projector_save_dir": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3.5-4B_target_Qwen3-4B",
     },
     {
         "id": "o1.7-dual-t4-T4",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
         "activation_model_name": "Qwen/Qwen3-4B",
-        "verbalizer_lora": "",
-        "projector_save_dir": "",
+        "verbalizer_lora": "checkpoints_phased_dual_o1.7_t4_T4/final",
+        "projector_save_dir": "checkpoints_phased_dual_o1.7_t4_T4",
     },
 ]
 
@@ -635,26 +514,33 @@ SECRET_EVALS_DEFAULT: dict[str, Any] = {
 
 def main() -> None:
     oracles, secret_evals = _manifest()
+    oracles = _normalize_manifest_rows(oracles)
     out_root = Path(os.environ.get("ORACLE_OOD_OUTPUT", "experiments/oracle_ood_matrix"))
-    layer_pct = int(os.environ.get("ORACLE_OOD_LAYER_PERCENT", "50"))
     for row in oracles:
         oid = row["id"]
         verbal = row.get("verbalizer_lora", "")
         if not verbal:
             _banner(oracle=oid, status="skip", reason="verbalizer_lora_empty")
             continue
-        if verbal.startswith("/") or verbal.startswith("."):
-            if not Path(verbal).exists():
-                _banner(oracle=oid, status="skip", reason="verbalizer_lora_path_not_found")
-                continue
+        if not Path(verbal).exists():
+            _banner(oracle=oid, status="skip", reason="verbalizer_lora_path_not_found", path=verbal)
+            continue
         odir = out_root / oid
         odir.mkdir(parents=True, exist_ok=True)
         o_name = row["oracle_model_name"]
         a_name = row.get("activation_model_name", o_name)
         for ev_name, spec in secret_evals.items():
-            tg = spec.get("targets") or []
+            tg = list(spec.get("targets") or [])
             if not tg:
-                _banner(oracle=oid, eval=ev_name, status="skip", reason="no_targets_configured")
+                tg = secret_targets_for_eval(ev_name, a_name)
+            if not tg:
+                _banner(
+                    oracle=oid,
+                    eval=ev_name,
+                    status="skip",
+                    reason="no_secret_targets_for_activation_model",
+                    activation=a_name,
+                )
                 continue
             if ev_name == "personaqa":
                 ctxp = REPO_ROOT / spec["persona_file"]
@@ -673,7 +559,6 @@ def main() -> None:
                 _run_secret_same_model(row, ev_name, spec, tg, odir)
             else:
                 _run_secret_cross_model(row, ev_name, spec, tg, odir)
-        _run_classification_for_oracle(row, odir, layer_pct)
     _banner(status="done")
 
 

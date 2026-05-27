@@ -21,7 +21,7 @@ from nl_probes.dataset_classes.classification import (
 from nl_probes.utils.activation_utils import get_hf_submodule
 from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.eval import parse_answer, run_evaluation
-from nl_probes.base_experiment import sanitize_lora_name
+from nl_probes.utils.lora_utils import sanitize_lora_name
 
 # -----------------------------
 # Configuration - tune here

@@ -20,15 +20,37 @@ def atomic_save(obj: dict, path: str) -> None:
             os.remove(tmp_path)
 
 
+def read_latest_checkpoint_meta(save_dir: str) -> dict[str, Any]:
+    """``global_step`` and ``extra`` from the latest checkpoint (no weight restore)."""
+    ckpt_path = find_latest_checkpoint(save_dir)
+    if ckpt_path is None:
+        return {}
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return {
+        "global_step": int(ckpt.get("global_step", 0)),
+        "extra": ckpt.get("extra") or {},
+    }
+
+
+def read_latest_checkpoint_extra(save_dir: str) -> dict[str, Any]:
+    """Load ``extra`` from the latest checkpoint without restoring weights."""
+    return read_latest_checkpoint_meta(save_dir).get("extra", {})
+
+
+def _checkpoint_step_number(path: Path) -> int:
+    stem = path.stem  # checkpoint_step_32075
+    return int(stem.rsplit("_", 1)[-1])
+
+
 def find_latest_checkpoint(save_dir: str) -> str | None:
-    """Find the latest checkpoint by modification time."""
+    """Find the latest checkpoint by step number (step checkpoints), else newest epoch ckpt."""
     p = Path(save_dir)
     if not p.exists():
         return None
-    step_ckpts = sorted(p.glob("checkpoint_step_*.pth"), key=lambda x: x.stat().st_mtime)
-    epoch_ckpts = sorted(p.glob("checkpoint_epoch_*.pth"), key=lambda x: x.stat().st_mtime)
+    step_ckpts = list(p.glob("checkpoint_step_*.pth"))
     if step_ckpts:
-        return str(step_ckpts[-1])
+        return str(max(step_ckpts, key=_checkpoint_step_number))
+    epoch_ckpts = sorted(p.glob("checkpoint_epoch_*.pth"), key=lambda x: x.stat().st_mtime)
     if epoch_ckpts:
         return str(epoch_ckpts[-1])
     return None
@@ -72,10 +94,10 @@ def load_checkpoint_if_exists(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any | None = None,
     modules_to_restore: dict[str, torch.nn.Module] | None = None,
-) -> tuple[int | None, int | None]:
+) -> tuple[int | None, int | None, dict[str, Any]]:
     ckpt_path = find_latest_checkpoint(save_dir)
     if ckpt_path is None:
-        return None, None
+        return None, None, {}
 
     ckpt = None
     load_kwargs = {"map_location": "cpu"}
@@ -130,7 +152,8 @@ def load_checkpoint_if_exists(
 
             np.random.set_state(rng["numpy"])
 
-    return int(ckpt.get("global_step", 0)), int(ckpt.get("epoch", 0))
+    extra = ckpt.get("extra") or {}
+    return int(ckpt.get("global_step", 0)), int(ckpt.get("epoch", 0)), extra
 
 
 def capture_rng_state() -> dict[str, Any]:

@@ -12,7 +12,7 @@ from nl_probes.utils.common import layer_percent_to_layer
 class SelfInterpTrainingConfig:
     # --- Models ---
     oracle_model_name: str = "Qwen/Qwen3-1.7B"
-    target_model_name: str = "Qwen/Qwen3.5-4B"
+    target_model_name: str = "Qwen/Qwen3-1.7B"
     hook_onto_layer: int = 1
     layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
     act_layers: list[int] = field(default_factory=list)  # derived if empty
@@ -95,13 +95,19 @@ class SelfInterpTrainingConfig:
             self.wandb_run_name = default_run
 
         # save dir namespacing
-        if self.wandb_suffix and not self.save_dir.endswith(self.wandb_suffix):
-            self.save_dir = f"{self.save_dir}{self.wandb_suffix}"
+        self.save_dir = namespaced_save_dir(self.save_dir, self.wandb_suffix)
 
         # repo id if pushing
         if self.hf_push_to_hub and not self.hf_repo_id:
             self.hf_repo_id = get_hf_repo_id(self.hf_repo_name)
         return self
+
+
+def namespaced_save_dir(save_dir: str = "checkpoints", wandb_suffix: str = "") -> str:
+    """Same path rule as ``SelfInterpTrainingConfig.finalize`` (without building loaders)."""
+    if wandb_suffix and not save_dir.endswith(wandb_suffix):
+        return f"{save_dir}{wandb_suffix}"
+    return save_dir
 
 
 def get_hf_repo_id(hf_repo_name: str) -> str:

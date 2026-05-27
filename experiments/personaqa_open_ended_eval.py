@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import VerbalizerInputInfo, VerbalizerResults
+from nl_probes.utils.lora_utils import secret_targets_personaqa
 from nl_probes.utils.common import load_model, load_tokenizer
 
 if __name__ == "__main__":
@@ -100,6 +101,18 @@ if __name__ == "__main__":
                 bnb_8bit_compute_dtype=torch.bfloat16,
             )
             model_kwargs = {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
+
+        elif model_name in ("Qwen/Qwen3-4B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3.5-4B"):
+            rows = secret_targets_personaqa(model_name)
+            if not rows:
+                raise ValueError(
+                    f"No personaqa target LoRAs on Hugging Face for {model_name} "
+                    "(paper uses adamkarvonen/Qwen3-8B-personaqa_shuffled_3_epochs and gemma/llama variants)."
+                )
+            target_lora_suffixes = [r["lora_hf_or_local"] for r in rows]
+            verbalizer_lora_paths = [None]
+            target_lora_path_template = "{lora_path}"
+            segment_start = -20
 
         else:
             raise ValueError(f"Unsupported MODEL_NAME: {model_name}")

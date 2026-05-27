@@ -36,11 +36,13 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 |------|------|
 | `nl_probes/sft.py` | Main distributed training: datasets → `train_model`, LoRA, steering, eval, checkpointing. |
 | `nl_probes/configs/sft_config.py` | `SelfInterpTrainingConfig`: oracle/target names, LoRA, schedule, `save_dir`, projection flags, etc. |
+| `nl_probes/utils/hf_config.py` | `pretrained_hidden_size` (composite configs), `pretrained_model_type_key` / same-family checks, gradient-checkpointing heuristic. |
 | `nl_probes/utils/steering_hooks.py` | Injects activation vectors into HF model residual stream (norm-matched additive steering). |
 | `nl_probes/utils/dataset_utils.py` | `TrainingDataPoint`, batching, on-the-fly activation materialization from target model. |
-| `nl_probes/utils/eval.py` | Generation-time eval with steering; supports separate `activation_model` / `activation_tokenizer` and `projection_module`. |
+| `nl_probes/utils/eval.py` | Generation-time eval with steering; uses `sanitize_lora_name` from `lora_utils`. |
+| `nl_probes/utils/lora_utils.py` | `sanitize_lora_name`; thesis secret-keeping target LoRA registry (`secret_targets_for_eval`). |
 | `nl_probes/utils/checkpointing.py` | Atomic checkpoint save/load helpers used by `sft.py`. |
-| `experiments/*_eval.py` | OOD / paper-style eval drivers (taboo, gender, SSC, personaqa, classification, …). **Do not `import` many of these modules** from new code: several run large grids at import time. |
+| `experiments/*_eval.py` | Paper-style OOD drivers (taboo, gender, SSC, personaqa, classification, …). **Do not `import` many of these modules** from new code: several run large grids at import time. |
 | `runner/` | Slurm examples; **do not overwrite `train.sbatch` unless asked**. |
 
 ---
@@ -56,23 +58,46 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 
 - If `target.hidden_size != oracle.hidden_size`, `train_model` constructs a learned linear map **target → oracle** and trains it jointly with the oracle LoRA (see `sft.py`). Weights are saved under checkpoint `module_states["activation_projector"]` (not inside the HF `final/` LoRA export).
 
+### Gradient checkpointing (memory heuristic)
+
+- **`SelfInterpTrainingConfig.gradient_checkpointing`** defaults to **off** (`False`).
+- **`nl_probes/sft.py` `__main__`** (torchrun / `runner/train.sbatch`): checkpointing is set **automatically** to **on** when the oracle and target share the same Hugging Face config **`model_type`** (same modeling code family), via `gradient_checkpointing_same_pretrained_family`. Different families stay **off** unless you change the code.
+- **`nl_probes/train_dual_target.py`**: `--gradient_checkpointing` / `--no-gradient_checkpointing` override; if omitted, checkpointing is **on** only when the oracle and **both** targets share that same **`model_type`** key (e.g. mixed Qwen3 + Qwen3.5 targets ⇒ **off**).
+
+### `build_loader_groups` (dataset batch size)
+
+- Signature uses **`act_collection_batch_size`** for all nested `DatasetLoaderConfig.batch_size` values. `sft.py` `__main__` passes the per-rank train batch size into that argument (same as before the refactor). `train_dual_target.py` passes its per-rank batch size the same way. There is no dependency on a module-level `train_batch_size` global.
+
+### In-training eval (`eval_all_datasets`)
+
+- Periodic eval during `train_model` passes **`lora_path=None`** into `run_evaluation`: the oracle already carries the trainable LoRA from `get_peft_model` or `PeftModel.from_pretrained`. This avoids re-loading `cfg.load_lora_path` as a second adapter (which broke on paths like `checkpoints_phased_dual_o1.7_t4_T4/final` because `.` is illegal in PyTorch module names).
+- PEFT adapter names are sanitized via `nl_probes.utils.lora_utils.sanitize_lora_name` (no import cycle with `base_experiment`).
+
 ### Phased dual-target training (`nl_probes/train_dual_target.py`)
 
 - **Purpose**: One Slurm/torchrun job that trains a single oracle on **two** targets in four phases (first half of A, first half of B, milestone log line + marker file, second halves), sharing one `wandb_suffix` / `save_dir`.
-- **Projector constraint:** `train_model` exposes **one** `activation_projector` for the run. The script therefore **requires** `target_a` and `target_b` to have the **same** `hidden_size` (validated up front with `AutoConfig`). If you truly need two different projection matrices for two different target widths, extend `train_model` first, then adjust this entrypoint.
-- **Run:** `runner/train_dual_target.sbatch` (or `torchrun nl_probes/train_dual_target.py` with the same CLI flags as in that sbatch).
+- **Projection constraint:** `train_model` exposes **one** `activation_projector` for the run. The script requires `target_a` and `target_b` to have the **same** hidden width (`pretrained_hidden_size`, including `text_config` for Qwen3.5).
+- **Phase-boundary checkpoints (dual-target only):** each phase calls `train_model(..., save_checkpoint_on_complete=True, dual_target_phase_label=...)`. That writes `checkpoint_step_{global_step}.pth` when the slice ends (1a, 1b, 2a, 2b), so the next phase resumes from the **phase boundary**, not from the last periodic `save_steps` tick mid-slice. Regular `nl_probes/sft.py` training does not set these flags.
+- **Per-phase resume (dual-target only):** `global_step` is cumulative across all four slices, but batch skipping uses `dual_target_phase` + `dual_target_phase_start_global_step` in checkpoint `extra`. A new phase always starts at offset 0 on its data slice (even if `global_step` is already ~32k). Without this, `global_step // steps_per_epoch` can equal `num_epochs` and the loop runs **eval only** with no training (see job `198518`).
+- **Phase routing on job restart:** `train_dual_target.py` does **not** always enter phase 1a. It resolves `save_dir` via `namespaced_save_dir(wandb_suffix)` (same rule as `finalize()` — **not** the raw dataclass default `checkpoints`). It reads `DUAL_TARGET_STATE.json`, then cumulative `global_step` (~32k per half-slice), then checkpoint `extra`. `MILESTONE_DUAL_TARGET_HALFWAY.txt` only forces phase 2a when `global_step >= ~64k` (job 198518 wrote the milestone after eval-only 1b at 32k). Completed phases are skipped; later phases load `{save_dir}/final`.
+- **Phase order:** 1a Qwen3-4B first half → 1b Qwen3.5-4B first half → milestone → 2a Qwen3-4B second half → 2b Qwen3.5-4B second half. After step ~32075 (end of 1a), the next run must be **1b**, not 1a again.
+- **Run:** `sbatch runner/train_dual_target.sbatch` → save dir `checkpoints_phased_dual_o1.7_t4_T4` (with `wandb_suffix` `_phased_dual_o1.7_t4_T4`).
+- **Resume:** Re-run the same sbatch; orchestrator jumps to the correct phase index; within a phase, resume from the latest `checkpoint_*.pth` under `save_dir`.
 
-### One-file OOD sweep (`nl_probes/oracle_ood_eval.py` + `runner/oracle_ood_eval.sbatch`)
+### One-file OOD secret-keeping sweep (`nl_probes/oracle_ood_eval.py` + `runner/oracle_ood_eval.sbatch`)
 
-- **Purpose:** Evaluate trained oracle LoRAs on benchmarks **outside** the default training mixture (taboo, gender, SSC, personaqa, plus **classification** test slices built like `experiments/classification_eval.py`).
-- **Configuration:** Edit `ORACLE_MANIFEST_DEFAULT` / `SECRET_EVALS_DEFAULT` at the bottom of `oracle_ood_eval.py`, **or** set `ORACLE_OOD_CONFIG` to a JSON file with keys `oracles` and `secret_evals` (same structure). Optional: `ORACLE_OOD_OUTPUT`, `ORACLE_OOD_LAYER_PERCENT`.
-- **Execution:** Same-base oracle and activation model → `base_experiment.run_verbalizer`. Different activation base (or explicit `projector_save_dir`) → two models, collect activations on the target stack, `create_verbalizer_inputs`, then `eval.run_evaluation` on the oracle with `projection_module` loaded from the latest `checkpoint_*.pth` under `projector_save_dir`.
-- **Logs:** grep for `ORACLE_OOD_EVAL` in Slurm `.out` / `.err`.
+- **Purpose:** Score the **8 thesis oracle checkpoints** on paper-style **secret-keeping** benchmarks only (taboo, gender, SSC, personaqa). **Does not** run classification (that mixture is already in `train.sbatch`). All oracles and activation bases are **Qwen3 / Qwen3.5 only** (no Gemma or Llama in the thesis matrix).
+- **Eight oracles:** (1) o1.7→t4 identity, (2) o1.7→t4 learned projection, (3) o1.7→t1.7, (4) o1.7→T3.5-4B, (5) o4→t4, (6) o4→T3.5-4B, (7) O3.5→t4, (8) o1.7 dual-target (t4 + T3.5-4B). See `ORACLE_MANIFEST_DEFAULT` in `oracle_ood_eval.py`.
+- **Datasets / prompts:** Same files as `experiments/taboo_open_ended_eval.py`, `gender_open_ended_eval.py`, `ssc_open_ended_eval.py`, `personaqa_open_ended_eval.py`.
+- **Target LoRAs:** `nl_probes/utils/lora_utils.py` (`secret_targets_for_eval`, etc.) for activation bases `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3.5-4B`. Taboo: 9 words on 4B (`chereddysaivreddy/...`), 3 on 1.7B (`bcywinski/...`), none on 3.5-4B. Gender, SSC, personaqa: skipped until Hub LoRAs exist for those bases.
+- **Default manifest (8 oracles):** `ORACLE_MANIFEST_DEFAULT` — repo-relative `verbalizer_lora` / `projector_save_dir` paths.
+- **Run:** `sbatch runner/oracle_ood_eval.sbatch` (HF login + `python -m nl_probes.oracle_ood_eval`).
+- **Logs:** grep `ORACLE_OOD_EVAL` in Slurm `.out` / `.err`.
 
 ### Checkpointing and evaluation artifacts
 
 - During training, `train_model` can resume from `checkpoint_*.pth` under `cfg.save_dir`.
-- At end of a successful training run, rank 0 saves **`{cfg.save_dir}/final`** (HF-compatible LoRA adapter folder) and runs a final in-training eval pass. Learned projection weights live in `module_states` inside `checkpoint_*.pth`, not inside `final/`.
+- At end of a successful training run, rank 0 saves **`{cfg.save_dir}/final`** (HF-compatible LoRA adapter folder). Learned projection weights live in `module_states` inside `checkpoint_*.pth`, not inside `final/`.
 
 ---
 
@@ -81,12 +106,13 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 | File | Role |
 |------|------|
 | `docs/introspection_adapters_and_oracle_lora.md` | Relates introspection-adapter ideas to this repo’s oracle LoRA setup. |
+| `docs/research_directions_next_steps.md` | Suggested novel experiments aligned with the paper and this fork. |
 | `EVAL_RESULTS.md` | Aggregated metrics snapshot from local `wandb-summary.json` files (update when new runs finish). |
 
 ---
 
 ## Thesis / evaluation pointers
 
-- **OOD eval drivers** live under `experiments/`; many expect you to paste **local or Hub** verbalizer adapter paths into the script body.
-- For quantitative tables already logged during training, see `EVAL_RESULTS.md` and the corresponding `wandb/run-*/files/wandb-summary.json`.
-- For the seven-oracle matrix (taboo / gender / SSC / personaqa / classification) without editing those experiment files, use `nl_probes/oracle_ood_eval.py` as described above.
+- **Per-benchmark Slurm drivers:** `runner/taboo.sbatch`, `gender.sbatch`, `ssc.sbatch`, `personaqa.sbatch` → corresponding `experiments/*_open_ended_eval.py`.
+- **Training:** `runner/train.sbatch` → `torchrun nl_probes/sft.py`.
+- **Eight-oracle matrix (secret-keeping only):** `runner/oracle_ood_eval.sbatch`.

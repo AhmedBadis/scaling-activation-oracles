@@ -46,8 +46,3 @@ NUM_GPUS=1
 # adjust nl_probes/sft.py args as needed, e.g., --config config.yaml --batch-size 8
 torchrun --nproc_per_node=$NUM_GPUS nl_probes/sft.py \
   --output_dir outputs/train
-
-
-
-  ############# FIND OUT NEXT STEPS ASK AI
-  ############# Gradient Checkpointing OFF by default, on if same family
