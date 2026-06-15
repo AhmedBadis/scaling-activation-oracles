@@ -6,7 +6,7 @@ half of target A's mixture, half of target B's, **milestone** marker, then the s
 
 **Projection note (current ``train_model`` API):** the training stack keeps a **single**
 ``activation_projector`` checkpoint key. That is sufficient when both targets share the same
-``hidden_size`` (typical for two “4B-class” Qwen checkpoints): one linear map
+``hidden_size`` (typical for two "4B-class" Qwen checkpoints): one linear map
 ``target_hidden -> oracle_hidden`` is shared across phases. If your two targets use **different**
 hidden widths, you need an extended ``train_model`` (not covered here) before this script can train
 two distinct projectors in one run.
@@ -28,8 +28,10 @@ from transformers import BitsAndBytesConfig
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig, namespaced_save_dir
 from nl_probes.sft import _ensure_datasets_exist, build_datasets, build_loader_groups, train_model
 from nl_probes.utils.checkpointing import read_latest_checkpoint_meta
-from nl_probes.utils.common import load_tokenizer
+from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.hf_config import dual_target_auto_gradient_checkpointing, pretrained_hidden_size
+from nl_probes.utils.activation_utils import get_hf_submodule
+from nl_probes.utils.eval import run_evaluation, score_eval_responses
 
 # Same table as ``nl_probes/sft.py`` ``__main__`` (classification sizes for ``build_loader_groups``).
 _MAIN_TRAIN_SIZE = 6000
@@ -293,6 +295,92 @@ def _run_phase(
     return cfg.save_dir
 
 
+def _eval_classification(
+    *,
+    cfg: SelfInterpTrainingConfig,
+    target_model_name: str,
+    lora_path: str,
+    loop_dataset_loaders: list,
+    tokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    model_kwargs: dict,
+    local_rank: int,
+    phase_label: str,
+) -> dict[str, float]:
+    """
+    Run classification eval on `target_model_name` using the oracle at `lora_path`.
+    Returns {dataset_name: accuracy} on rank 0; empty dict on other ranks.
+    """
+    if local_rank != 0:
+        dist.barrier()
+        return {}
+
+    from nl_probes.utils.lora_utils import sanitize_lora_name
+
+    oracle_model = load_model(cfg.oracle_model_name, dtype, **{**model_kwargs, "device_map": {"": f"cuda:{local_rank}"}})
+    target_model = load_model(target_model_name, dtype, **{**model_kwargs, "device_map": {"": f"cuda:{local_rank}"}})
+    target_model.eval()
+
+    lora_san = sanitize_lora_name(lora_path)
+    oracle_model.load_adapter(lora_path, adapter_name=lora_san, is_trainable=False)
+    oracle_model.set_adapter(lora_san)
+    oracle_model.eval()
+
+    submodule = get_hf_submodule(oracle_model, cfg.hook_onto_layer)
+    target_tokenizer = load_tokenizer(target_model_name)
+
+    # projector (if hidden sizes differ)
+    target_width = target_model.config.hidden_size
+    oracle_width = oracle_model.config.hidden_size
+    projector = None
+    if target_width != oracle_width:
+        import glob as _glob
+        pths = sorted(_glob.glob(os.path.join(cfg.save_dir, "checkpoint_step_*.pth")))
+        if pths:
+            ckpt = torch.load(pths[-1], map_location=device, weights_only=False)
+            proj_sd = ckpt["module_states"]["activation_projector"]
+            has_bias = "bias" in proj_sd
+            projector = torch.nn.Linear(target_width, oracle_width, bias=has_bias, device=device, dtype=dtype)
+            projector.load_state_dict(proj_sd)
+            projector.eval()
+
+    _, all_eval_data = build_datasets(cfg, dataset_loaders=loop_dataset_loaders, window_mult=None)
+
+    scores: dict[str, float] = {}
+    for ds_name, eval_data in all_eval_data.items():
+        results = run_evaluation(
+            eval_data=eval_data,
+            model=oracle_model,
+            tokenizer=tokenizer,
+            submodule=submodule,
+            device=device,
+            dtype=dtype,
+            global_step=-1,
+            lora_path=lora_san,
+            eval_batch_size=cfg.eval_batch_size,
+            steering_coefficient=1.0,
+            generation_kwargs={"do_sample": False, "temperature": 0.0, "max_new_tokens": 10},
+            activation_tokenizer=target_tokenizer,
+            activation_model=target_model,
+            projection_module=projector,
+        )
+        _fmt_correct, ans_correct = score_eval_responses(results, eval_data)
+        scores[ds_name] = ans_correct
+
+    avg = sum(scores.values()) / len(scores) if scores else float("nan")
+    print(f"\n[{phase_label}] Eval on target={target_model_name}")
+    for ds, acc in sorted(scores.items()):
+        print(f"  {ds:<42} {acc:.4f}")
+    print(f"  {'AVERAGE':<42} {avg:.4f}\n", flush=True)
+
+    del oracle_model, target_model, projector
+    torch.cuda.empty_cache()
+
+    dist.barrier()
+    return scores
+
+
 if __name__ == "__main__":
     args = _parse_args()
     if args.gradient_checkpointing is None:
@@ -335,7 +423,7 @@ if __name__ == "__main__":
 
     tokenizer = load_tokenizer(args.oracle_model_name)
 
-    def loop_for(target_name: str):
+    def loop_for(target_name: str) -> list:
         lg = build_loader_groups(
             model_name=target_name,
             prompt_model_name=args.oracle_model_name,
@@ -353,25 +441,25 @@ if __name__ == "__main__":
     save_dir = namespaced_save_dir(wandb_suffix=args.wandb_suffix)
 
     start_phase_idx = _first_phase_index_to_run(save_dir)
-    if start_phase_idx >= len(DUAL_TARGET_PHASE_LABELS):
-        if local_rank == 0:
-            print(f"DUAL_TARGET: all phases complete (index {start_phase_idx}), nothing to train.")
-        dist.destroy_process_group()
-        raise SystemExit(0)
+    all_phases_complete = start_phase_idx >= len(DUAL_TARGET_PHASE_LABELS)
 
-    if local_rank == 0:
-        print(
-            f"DUAL_TARGET resume: starting at phase index {start_phase_idx} "
-            f"({DUAL_TARGET_PHASE_LABELS[start_phase_idx]}) save_dir={save_dir}"
-        )
-        if start_phase_idx > 0 and not _read_dual_target_state(save_dir):
-            meta = read_latest_checkpoint_meta(save_dir)
-            _write_dual_target_state(
-                save_dir,
-                start_phase_idx,
-                DUAL_TARGET_PHASE_LABELS[start_phase_idx - 1],
-                int(meta.get("global_step", 0)),
+    if all_phases_complete:
+        if local_rank == 0:
+            print(f"DUAL_TARGET: all phases complete (index {start_phase_idx}), running final eval.")
+    else:
+        if local_rank == 0:
+            print(
+                f"DUAL_TARGET resume: starting at phase index {start_phase_idx} "
+                f"({DUAL_TARGET_PHASE_LABELS[start_phase_idx]}) save_dir={save_dir}"
             )
+            if start_phase_idx > 0 and not _read_dual_target_state(save_dir):
+                meta = read_latest_checkpoint_meta(save_dir)
+                _write_dual_target_state(
+                    save_dir,
+                    start_phase_idx,
+                    DUAL_TARGET_PHASE_LABELS[start_phase_idx - 1],
+                    int(meta.get("global_step", 0)),
+                )
     dist.barrier()
 
     lora_path: str | None = None
@@ -385,7 +473,6 @@ if __name__ == "__main__":
             "target": args.target_a,
             "half": 0,
             "loaders": loop_a,
-            "load_lora": None,
         },
         {
             "index": 1,
@@ -457,5 +544,37 @@ if __name__ == "__main__":
                     f.write(f"target_b={args.target_b}\n")
                     f.write(f"oracle={args.oracle_model_name}\n")
             dist.barrier()
+
+    # ── Final eval on both targets ────────────────────────────────────────
+    final_lora = os.path.join(save_dir, "final")
+    all_target_scores: dict[str, dict[str, float]] = {}
+    for target_name, loaders in [(args.target_a, loop_a), (args.target_b, loop_b)]:
+        eval_cfg = SelfInterpTrainingConfig(
+            oracle_model_name=args.oracle_model_name,
+            target_model_name=target_name,
+            wandb_suffix=args.wandb_suffix,
+        )
+        eval_cfg.eval_batch_size = (train_batch_size * world_size) * 8
+        eval_cfg.hook_onto_layer = args.hook_onto_layer
+        eval_cfg.layer_percents = args.layer_percents
+        eval_cfg.finalize(dataset_loaders=loaders)
+        scores = _eval_classification(
+            cfg=eval_cfg,
+            target_model_name=target_name,
+            lora_path=final_lora,
+            loop_dataset_loaders=loaders,
+            tokenizer=tokenizer,
+            device=device,
+            dtype=dtype,
+            model_kwargs=model_kwargs,
+            local_rank=local_rank,
+            phase_label=f"final_eval_target_{target_name.split('/')[-1]}",
+        )
+        all_target_scores[target_name] = scores
+
+    if local_rank == 0 and all_target_scores:
+        all_accs = [acc for scores in all_target_scores.values() for acc in scores.values()]
+        grand_avg = sum(all_accs) / len(all_accs)
+        print(f"\nGRAND AVERAGE (both targets, all datasets): {grand_avg:.4f}\n", flush=True)
 
     dist.destroy_process_group()
