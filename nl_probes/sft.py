@@ -47,7 +47,6 @@ from nl_probes.dataset_classes.sae_training_data import (
 )
 from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets
 from nl_probes.utils.common import load_model, load_tokenizer, set_seed
-from nl_probes.utils.hf_config import gradient_checkpointing_same_pretrained_family
 from nl_probes.utils.dataset_utils import (
     BatchData,
     EvalStepResult,
@@ -1299,16 +1298,7 @@ if __name__ == "__main__":
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
     train_batch_size = 16
-    gradient_checkpointing = gradient_checkpointing_same_pretrained_family(
-        cfg.oracle_model_name, cfg.target_model_name
-    )
-    if local_rank == 0:
-        print(
-            "gradient_checkpointing: "
-            f"{gradient_checkpointing} "
-            f"(on when oracle and target share the same HF config model_type; "
-            f"{cfg.oracle_model_name!r} vs {cfg.target_model_name!r})"
-        )
+    gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
     if target_model_name == "Qwen/Qwen3-32B" or target_model_name == "meta-llama/Llama-3.3-70B-Instruct":

@@ -36,7 +36,6 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 |------|------|
 | `nl_probes/sft.py` | Main distributed training: datasets → `train_model`, LoRA, steering, eval, checkpointing. |
 | `nl_probes/configs/sft_config.py` | `SelfInterpTrainingConfig`: oracle/target names, LoRA, schedule, `save_dir`, projection flags, etc. |
-| `nl_probes/utils/hf_config.py` | `pretrained_hidden_size` (composite configs), `pretrained_model_type_key` / same-family checks, gradient-checkpointing heuristic. |
 | `nl_probes/utils/steering_hooks.py` | Injects activation vectors into HF model residual stream (norm-matched additive steering). |
 | `nl_probes/utils/dataset_utils.py` | `TrainingDataPoint`, batching, on-the-fly activation materialization from target model. |
 | `nl_probes/utils/eval.py` | Generation-time eval with steering; uses `sanitize_lora_name` from `lora_utils`. |
@@ -58,12 +57,6 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 
 - If `target.hidden_size != oracle.hidden_size`, `train_model` constructs a learned linear map **target → oracle** and trains it jointly with the oracle LoRA (see `sft.py`). Weights are saved under checkpoint `module_states["activation_projector"]` (not inside the HF `final/` LoRA export).
 
-### Gradient checkpointing (memory heuristic)
-
-- **`SelfInterpTrainingConfig.gradient_checkpointing`** defaults to **off** (`False`).
-- **`nl_probes/sft.py` `__main__`** (torchrun / `runner/train.sbatch`): checkpointing is set **automatically** to **on** when the oracle and target share the same Hugging Face config **`model_type`** (same modeling code family), via `gradient_checkpointing_same_pretrained_family`. Different families stay **off** unless you change the code.
-- **`nl_probes/train_dual_target.py`**: `--gradient_checkpointing` / `--no-gradient_checkpointing` override; if omitted, checkpointing is **on** only when the oracle and **both** targets share that same **`model_type`** key (e.g. mixed Qwen3 + Qwen3.5 targets ⇒ **off**).
-
 ### `build_loader_groups` (dataset batch size)
 
 - Signature uses **`act_collection_batch_size`** for all nested `DatasetLoaderConfig.batch_size` values. `sft.py` `__main__` passes the per-rank train batch size into that argument (same as before the refactor). `train_dual_target.py` passes its per-rank batch size the same way. There is no dependency on a module-level `train_batch_size` global.
@@ -84,15 +77,43 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 - **Run:** `sbatch runner/train_dual_target.sbatch` → save dir `checkpoints_phased_dual_o1.7_t4_T4` (with `wandb_suffix` `_phased_dual_o1.7_t4_T4`).
 - **Resume:** Re-run the same sbatch; orchestrator jumps to the correct phase index; within a phase, resume from the latest `checkpoint_*.pth` under `save_dir`.
 
-### One-file OOD secret-keeping sweep (`nl_probes/oracle_ood_eval.py` + `runner/oracle_ood_eval.sbatch`)
+### Sequential dual-target oracle training
 
-- **Purpose:** Score the **8 thesis oracle checkpoints** on paper-style **secret-keeping** benchmarks only (taboo, gender, SSC, personaqa). **Does not** run classification (that mixture is already in `train.sbatch`). All oracles and activation bases are **Qwen3 / Qwen3.5 only** (no Gemma or Llama in the thesis matrix).
-- **Eight oracles:** (1) o1.7→t4 identity, (2) o1.7→t4 learned projection, (3) o1.7→t1.7, (4) o1.7→T3.5-4B, (5) o4→t4, (6) o4→T3.5-4B, (7) O3.5→t4, (8) o1.7 dual-target (t4 + T3.5-4B). See `ORACLE_MANIFEST_DEFAULT` in `oracle_ood_eval.py`.
-- **Datasets / prompts:** Same files as `experiments/taboo_open_ended_eval.py`, `gender_open_ended_eval.py`, `ssc_open_ended_eval.py`, `personaqa_open_ended_eval.py`.
-- **Target LoRAs:** `nl_probes/utils/lora_utils.py` (`secret_targets_for_eval`, etc.) for activation bases `Qwen/Qwen3-1.7B`, `Qwen/Qwen3-4B`, `Qwen/Qwen3.5-4B`. Taboo: 9 words on 4B (`chereddysaivreddy/...`), 3 on 1.7B (`bcywinski/...`), none on 3.5-4B. Gender, SSC, personaqa: skipped until Hub LoRAs exist for those bases.
-- **Default manifest (8 oracles):** `ORACLE_MANIFEST_DEFAULT` — repo-relative `verbalizer_lora` / `projector_save_dir` paths.
-- **Run:** `sbatch runner/oracle_ood_eval.sbatch` (HF login + `python -m nl_probes.oracle_ood_eval`).
-- **Logs:** grep `ORACLE_OOD_EVAL` in Slurm `.out` / `.err`.
+train_seq_dual_target.py
+
+Calls ``train_model`` from ``nl_probes/sft.py`` twice on the same ``wandb_suffix`` / ``save_dir``:
+**all** of target A, then **all** of target B — no interleaving.
+
+Resume logic (in order of priority):
+1. ``SEQ_DUAL_TARGET_STATE.json`` in save_dir  →  authoritative phase pointer.
+2. ``save_dir/final`` exists                   →  phase A already done.
+3. ``--bootstrap_lora_path`` exists            →  use external checkpoint for A, skip to B.
+4. Fallback                                    →  start from scratch (phase A).
+
+### Classification evaluation for locally-trained oracle checkpoints.
+
+This is less relevant for the thesis and is rather troubleshooting
+
+For dual-target checkpoints the oracle is evaluated against each target separately.
+
+Usage (normally via the .sbatch runner):
+    python experiments/classification_eval_oracles.py
+
+### OOD classification evaluation for trained oracle LoRAs.
+
+Evaluates each oracle from the manifest on classification datasets that were
+NOT seen during training (engels_* datasets). Handles both same-model and
+cross-model (oracle != activation model) setups with projector loading.
+
+Run:
+    python experiments/ood_classification_eval.py
+or via Slurm:
+    sbatch runner/ood_classification_eval.sbatch
+
+Output: experiments/ood_classification_eval/{oracle_id}/results.json
+Summarize: python experiments/summarize_ood_classification_eval.py
+
+###
 
 ### Checkpointing and evaluation artifacts
 
@@ -107,7 +128,9 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 |------|------|
 | `docs/introspection_adapters_and_oracle_lora.md` | Relates introspection-adapter ideas to this repo’s oracle LoRA setup. |
 | `docs/research_directions_next_steps.md` | Suggested novel experiments aligned with the paper and this fork. |
-| `EVAL_RESULTS.md` | Aggregated metrics snapshot from local `wandb-summary.json` files (update when new runs finish). |
+| `EVAL_RESULTS.md` | Aggregated metrics snapshot from local `wandb-summary.json` files. |
+
+It is better to ask the user directly for evaluation metrics instead of trying to access them.
 
 ---
 
