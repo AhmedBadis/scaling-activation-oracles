@@ -66,7 +66,7 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 - Periodic eval during `train_model` passes **`lora_path=None`** into `run_evaluation`: the oracle already carries the trainable LoRA from `get_peft_model` or `PeftModel.from_pretrained`. This avoids re-loading `cfg.load_lora_path` as a second adapter (which broke on paths like `checkpoints_phased_dual_o1.7_t4_T4/final` because `.` is illegal in PyTorch module names).
 - PEFT adapter names are sanitized via `nl_probes.utils.lora_utils.sanitize_lora_name` (no import cycle with `base_experiment`).
 
-### Phased dual-target training (`nl_probes/train_dual_target.py`)
+### Phased dual-target training (`nl_probes/train_phased_dual_target.py`)
 
 - **Purpose**: One Slurm/torchrun job that trains a single oracle on **two** targets in four phases (first half of A, first half of B, milestone log line + marker file, second halves), sharing one `wandb_suffix` / `save_dir`.
 - **Projection constraint:** `train_model` exposes **one** `activation_projector` for the run. The script requires `target_a` and `target_b` to have the **same** hidden width (`pretrained_hidden_size`, including `text_config` for Qwen3.5).
@@ -79,7 +79,7 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 
 ### Sequential dual-target oracle training
 
-train_seq_dual_target.py
+train_sequential_dual_target.py
 
 Calls ``train_model`` from ``nl_probes/sft.py`` twice on the same ``wandb_suffix`` / ``save_dir``:
 **all** of target A, then **all** of target B — no interleaving.
