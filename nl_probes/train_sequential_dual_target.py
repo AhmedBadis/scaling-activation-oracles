@@ -28,7 +28,7 @@ from nl_probes.configs.sft_config import SelfInterpTrainingConfig, namespaced_sa
 from nl_probes.sft import _ensure_datasets_exist, build_datasets, build_loader_groups, train_model
 from nl_probes.utils.checkpointing import read_latest_checkpoint_meta
 from nl_probes.utils.common import load_model, load_tokenizer
-from nl_probes.utils.hf_config import dual_target_auto_gradient_checkpointing, pretrained_hidden_size
+from nl_probes.utils.hf_config import pretrained_hidden_size
 from nl_probes.utils.activation_utils import get_hf_submodule
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
 
@@ -347,11 +347,6 @@ def _eval_classification(
 
 if __name__ == "__main__":
     args = _parse_args()
-
-    if args.gradient_checkpointing is None:
-        args.gradient_checkpointing = dual_target_auto_gradient_checkpointing(
-            args.oracle_model_name, args.target_a, args.target_b
-        )
 
     wa = pretrained_hidden_size(args.target_a)
     wb = pretrained_hidden_size(args.target_b)

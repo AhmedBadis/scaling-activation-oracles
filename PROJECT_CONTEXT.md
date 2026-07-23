@@ -59,7 +59,7 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 
 ### `build_loader_groups` (dataset batch size)
 
-- Signature uses **`act_collection_batch_size`** for all nested `DatasetLoaderConfig.batch_size` values. `sft.py` `__main__` passes the per-rank train batch size into that argument (same as before the refactor). `train_dual_target.py` passes its per-rank batch size the same way. There is no dependency on a module-level `train_batch_size` global.
+- Signature uses **`act_collection_batch_size`** for all nested `DatasetLoaderConfig.batch_size` values. `sft.py` `__main__` passes the per-rank train batch size into that argument (same as before the refactor). `train_phased_dual_target.py` passes its per-rank batch size the same way. There is no dependency on a module-level `train_batch_size` global.
 
 ### In-training eval (`eval_all_datasets`)
 
@@ -72,9 +72,9 @@ WandB local folders under `wandb/` sometimes encode shorthand in the run directo
 - **Projection constraint:** `train_model` exposes **one** `activation_projector` for the run. The script requires `target_a` and `target_b` to have the **same** hidden width (`pretrained_hidden_size`, including `text_config` for Qwen3.5).
 - **Phase-boundary checkpoints (dual-target only):** each phase calls `train_model(..., save_checkpoint_on_complete=True, dual_target_phase_label=...)`. That writes `checkpoint_step_{global_step}.pth` when the slice ends (1a, 1b, 2a, 2b), so the next phase resumes from the **phase boundary**, not from the last periodic `save_steps` tick mid-slice. Regular `nl_probes/sft.py` training does not set these flags.
 - **Per-phase resume (dual-target only):** `global_step` is cumulative across all four slices, but batch skipping uses `dual_target_phase` + `dual_target_phase_start_global_step` in checkpoint `extra`. A new phase always starts at offset 0 on its data slice (even if `global_step` is already ~32k). Without this, `global_step // steps_per_epoch` can equal `num_epochs` and the loop runs **eval only** with no training (see job `198518`).
-- **Phase routing on job restart:** `train_dual_target.py` does **not** always enter phase 1a. It resolves `save_dir` via `namespaced_save_dir(wandb_suffix)` (same rule as `finalize()` — **not** the raw dataclass default `checkpoints`). It reads `DUAL_TARGET_STATE.json`, then cumulative `global_step` (~32k per half-slice), then checkpoint `extra`. `MILESTONE_DUAL_TARGET_HALFWAY.txt` only forces phase 2a when `global_step >= ~64k` (job 198518 wrote the milestone after eval-only 1b at 32k). Completed phases are skipped; later phases load `{save_dir}/final`.
+- **Phase routing on job restart:** `train_phased_dual_target.py` does **not** always enter phase 1a. It resolves `save_dir` via `namespaced_save_dir(wandb_suffix)` (same rule as `finalize()` — **not** the raw dataclass default `checkpoints`). It reads `DUAL_TARGET_STATE.json`, then cumulative `global_step` (~32k per half-slice), then checkpoint `extra`. `MILESTONE_DUAL_TARGET_HALFWAY.txt` only forces phase 2a when `global_step >= ~64k` (job 198518 wrote the milestone after eval-only 1b at 32k). Completed phases are skipped; later phases load `{save_dir}/final`.
 - **Phase order:** 1a Qwen3-4B first half → 1b Qwen3.5-4B first half → milestone → 2a Qwen3-4B second half → 2b Qwen3.5-4B second half. After step ~32075 (end of 1a), the next run must be **1b**, not 1a again.
-- **Run:** `sbatch runner/train_dual_target.sbatch` → save dir `checkpoints_phased_dual_o1.7_t4_T4` (with `wandb_suffix` `_phased_dual_o1.7_t4_T4`).
+- **Run:** `sbatch runner/train_phased_dual_target.sbatch` → save dir `checkpoints_phased_dual_o1.7_t4_T4` (with `wandb_suffix` `_phased_dual_o1.7_t4_T4`).
 - **Resume:** Re-run the same sbatch; orchestrator jumps to the correct phase index; within a phase, resume from the latest `checkpoint_*.pth` under `save_dir`.
 
 ### Sequential dual-target oracle training
