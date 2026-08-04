@@ -41,4 +41,5 @@ torchrun --nproc_per_node=1 nl_probes/train_phased_dual_target.py \
   --target_b="Qwen/Qwen3.5-4B" \
   --wandb_suffix="_phased_dual_o1.7_t4_T4" \
   --train_batch_size=16 \
-  --gradient_accumulation_steps=1
+  --gradient_accumulation_steps=1 \
+  --n_chunks=16

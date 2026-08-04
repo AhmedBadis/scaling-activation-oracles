@@ -1,8 +1,27 @@
 """
 Phased dual-target oracle training (single ``torchrun`` job).
 
-Calls ``train_model`` from ``nl_probes/sft.py`` four times on the same ``wandb_suffix`` / ``save_dir``:
-half of target A's mixture, half of target B's, **milestone** marker, then the second halves.
+Calls ``train_model`` from ``nl_probes/sft.py`` many times on the same ``wandb_suffix`` /
+``save_dir``, round-robining between target A and target B in small **chunks** instead of
+halves. This makes the oracle interleave between the two targets much more finely (more,
+smaller context switches) while keeping the exact same total amount of training data per
+target as before.
+
+**Chunking:** each target's training mixture is split into ``N_CHUNKS`` contiguous slices
+(default 16). Phases run in round-robin order: A-chunk0, B-chunk0, A-chunk1, B-chunk1, ...,
+A-chunk{N-1}, B-chunk{N-1}. That is ``2 * N_CHUNKS`` phases total, each one a full
+``train_model`` call that reloads/re-attaches the target model. Lower ``N_CHUNKS`` back
+toward 2 (halves) if per-phase model-reload overhead is too costly on your hardware;
+raise it for finer interleaving.
+
+**Dataset-size matching with the triple-target script:** to keep the *total* number of
+training examples equal between this dual-target run and ``train_phased_triple_target.py``
+(which has three targets sharing the same per-dataset pool sizes), this script trains on
+the **full** ``CLASSIFICATION_DATASETS`` sizes below, while the triple-target script scales
+its per-target sizes down by ``2/3``. Concretely: dual trains 2 targets x N examples/target
+= 2N total; triple trains 3 targets x (2/3)N examples/target = 2N total. Same grand total.
+If you change ``_MAIN_TRAIN_SIZE`` here, update the scale factor in the triple-target
+script to match.
 
 **Projection note (current ``train_model`` API):** the training stack keeps a **single**
 ``activation_projector`` checkpoint key. That is sufficient when both targets share the same
@@ -33,7 +52,16 @@ from nl_probes.utils.hf_config import pretrained_hidden_size
 from nl_probes.utils.activation_utils import get_hf_submodule
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
 
+# ── chunk config ────────────────────────────────────────────────────────────
+# Number of contiguous slices each target's training mixture is split into.
+# Total phases = 2 * N_CHUNKS (round-robin: A0, B0, A1, B1, ..., A{N-1}, B{N-1}).
+# Tune this down if per-phase target-model reload overhead is too costly on your GPU;
+# tune it up for finer-grained interleaving between the two targets.
+N_CHUNKS = 16
+
 # Same table as ``nl_probes/sft.py`` ``__main__`` (classification sizes for ``build_loader_groups``).
+# Dual-target keeps the FULL size per target; triple-target scales this down by 2/3 so that
+# total training examples (targets x per-target size) match between the two scripts.
 _MAIN_TRAIN_SIZE = 6000
 _MAIN_TEST_SIZE = 250
 CLASSIFICATION_DATASETS: dict[str, dict[str, Any]] = {
@@ -84,21 +112,18 @@ CLASSIFICATION_DATASETS: dict[str, dict[str, Any]] = {
 
 MILESTONE_LOG_LINE = (
     "MILESTONE_DUAL_TARGET_HALFWAY "
-    "phase=after_first_half_target_A_and_first_half_target_B "
+    "phase=after_first_half_of_chunks_both_targets "
     "search_this_string_in_slurm_out_or_err"
 )
 
-DUAL_TARGET_PHASE_LABELS: list[str] = [
-    "phase_1a_first_half_target_A",
-    "phase_1b_first_half_target_B",
-    "phase_2a_second_half_target_A",
-    "phase_2b_second_half_target_B",
-]
-
 DUAL_TARGET_STATE_FILENAME = "DUAL_TARGET_STATE.json"
 
-# Each half-slice is ~32k optimizer steps on 1 GPU; used when milestone/ckpt metadata lie.
-_DUAL_TARGET_STEPS_PER_HALF = 30_000
+# Approx optimizer steps per chunk on 1 GPU; used only as a fallback for step-based resume
+# when the JSON state file is missing (e.g. first-ever run of a resumed old save_dir).
+# Previously (2 chunks/target == halves) each half was ~30_000 steps; with N_CHUNKS chunks
+# each chunk is proportionally smaller.
+_DUAL_TARGET_STEPS_PER_HALF_LEGACY = 30_000
+_DUAL_TARGET_STEPS_PER_CHUNK = max(1, (_DUAL_TARGET_STEPS_PER_HALF_LEGACY * 2) // N_CHUNKS)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -119,6 +144,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--eval_steps", type=int, default=10_000)
     p.add_argument("--save_steps", type=int, default=10_000)
     p.add_argument("--layer_percents", type=int, nargs="+", default=[25, 50, 75])
+    p.add_argument(
+        "--n_chunks",
+        type=int,
+        default=N_CHUNKS,
+        help=f"Number of chunks to split each target's mixture into (default {N_CHUNKS}). "
+        "Total phases = 2 * n_chunks.",
+    )
     return p.parse_args()
 
 
@@ -159,31 +191,33 @@ def _read_dual_target_state(save_dir: str) -> dict[str, Any]:
     return {}
 
 
-def _write_dual_target_state(save_dir: str, next_phase_index: int, last_completed_phase: str, global_step: int) -> None:
+def _write_dual_target_state(
+    save_dir: str, next_phase_index: int, last_completed_phase: str, global_step: int, phase_labels: list[str]
+) -> None:
     payload = {
         "next_phase_index": next_phase_index,
         "last_completed_phase": last_completed_phase,
         "global_step": global_step,
-        "phase_order": DUAL_TARGET_PHASE_LABELS,
+        "phase_order": phase_labels,
     }
     with open(_dual_target_state_path(save_dir), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
-def _phase_index_from_global_step(global_step: int) -> int:
-    """Map cumulative step count to the next phase index (0=1a … 3=2b)."""
-    if global_step >= 3 * _DUAL_TARGET_STEPS_PER_HALF:
-        return 3
-    if global_step >= 2 * _DUAL_TARGET_STEPS_PER_HALF:
-        return 2
-    if global_step >= _DUAL_TARGET_STEPS_PER_HALF:
-        return 1
+def _phase_index_from_global_step(global_step: int, n_phases: int) -> int:
+    """Map cumulative step count to the next phase index, using the approx steps/chunk."""
+    for i in range(n_phases, 0, -1):
+        if global_step >= i * _DUAL_TARGET_STEPS_PER_CHUNK:
+            return i
     return 0
 
 
-def _first_phase_index_to_run(save_dir: str) -> int:
+def _first_phase_index_to_run(save_dir: str, n_phases: int) -> int:
     """
-    Order after global_step ~32075 (end of 1a): 1b (Qwen3.5-4B first half), then 2a, then 2b.
+    JSON state file (written after every completed phase) is the source of truth and works
+    regardless of chunk granularity. The step-based heuristics below are only a fallback for
+    resuming a save_dir that has checkpoints but no state file yet (e.g. migrating from an
+    older run of this script).
     """
     state = _read_dual_target_state(save_dir)
     if state:
@@ -193,36 +227,26 @@ def _first_phase_index_to_run(save_dir: str) -> int:
     global_step = int(meta.get("global_step", 0))
     extra = meta.get("extra", {})
 
-    # Milestone is written when phase 1b *finishes*; job 198518 hit eval-only 1b at step 32k
-    # and still wrote the marker — require ~64k steps before trusting it.
     milestone_path = os.path.join(save_dir, "MILESTONE_DUAL_TARGET_HALFWAY.txt")
-    if os.path.isfile(milestone_path) and global_step >= 2 * _DUAL_TARGET_STEPS_PER_HALF:
-        return 2
+    halfway_index = n_phases // 2
+    if os.path.isfile(milestone_path) and global_step >= halfway_index * _DUAL_TARGET_STEPS_PER_CHUNK:
+        return halfway_index
 
-    step_index = _phase_index_from_global_step(global_step)
+    step_index = _phase_index_from_global_step(global_step, n_phases)
 
     completed = extra.get("dual_target_phase")
-    if completed not in DUAL_TARGET_PHASE_LABELS:
+    if not completed:
         return step_index
 
-    phase_idx = DUAL_TARGET_PHASE_LABELS.index(completed)
-    if extra.get("dual_target_phase_complete"):
-        meta_index = phase_idx + 1
-        # Ignore bogus complete flags when global_step has not advanced (e.g. phase_2b @ 32k).
-        return max(step_index, meta_index) if global_step >= (phase_idx + 1) * _DUAL_TARGET_STEPS_PER_HALF else step_index
-
-    phase_start = int(extra.get("dual_target_phase_start_global_step", 0))
-    if phase_idx == 0 and global_step > 0 and phase_start == global_step:
-        return max(step_index, 1)
-
-    return max(step_index, phase_idx)
+    return step_index
 
 
 def _run_phase(
     *,
     cfg: SelfInterpTrainingConfig,
     target_model_name: str,
-    which_half: int,
+    chunk_index: int,
+    n_chunks: int,
     load_lora_path: str | None,
     phase_label: str,
     loop_dataset_loaders: list,
@@ -239,6 +263,7 @@ def _run_phase(
     save_steps: int,
     layer_percents: List[int],
     phase_index: int,
+    phase_labels: list[str],
 ) -> str:
     cfg.target_model_name = target_model_name
     cfg.load_lora_path = load_lora_path
@@ -266,11 +291,15 @@ def _run_phase(
         cfg, dataset_loaders=loop_dataset_loaders, window_mult=cfg.window_mult
     )
     n = len(all_training_data)
-    mid = n // 2
-    train_slice = slice(0, mid) if which_half == 0 else slice(mid, n)
+    chunk_size = n // n_chunks
+    start = chunk_index * chunk_size
+    end = n if chunk_index == n_chunks - 1 else start + chunk_size
+    train_slice = slice(start, end)
     phase_train = all_training_data[train_slice]
     if local_rank == 0:
-        print(f"[{phase_label}] half={which_half} slice={train_slice} of n={n} -> len={len(phase_train)}")
+        print(
+            f"[{phase_label}] chunk={chunk_index}/{n_chunks} slice={train_slice} of n={n} -> len={len(phase_train)}"
+        )
         print(asdict(cfg))
 
     train_model(
@@ -290,7 +319,7 @@ def _run_phase(
     meta = read_latest_checkpoint_meta(cfg.save_dir)
     global_step = int(meta.get("global_step", 0))
     if local_rank == 0:
-        _write_dual_target_state(cfg.save_dir, phase_index + 1, phase_label, global_step)
+        _write_dual_target_state(cfg.save_dir, phase_index + 1, phase_label, global_step, phase_labels)
     dist.barrier()
     return cfg.save_dir
 
@@ -383,6 +412,8 @@ def _eval_classification(
 
 if __name__ == "__main__":
     args = _parse_args()
+    n_chunks = args.n_chunks
+    assert n_chunks >= 1, "n_chunks must be >= 1"
 
     wa = pretrained_hidden_size(args.target_a)
     wb = pretrained_hidden_size(args.target_b)
@@ -437,8 +468,28 @@ if __name__ == "__main__":
 
     save_dir = namespaced_save_dir(wandb_suffix=args.wandb_suffix)
 
-    start_phase_idx = _first_phase_index_to_run(save_dir)
-    all_phases_complete = start_phase_idx >= len(DUAL_TARGET_PHASE_LABELS)
+    # ── build round-robin phase schedule: A0, B0, A1, B1, ..., A{n-1}, B{n-1} ──
+    targets_info = [("A", args.target_a, loop_a), ("B", args.target_b, loop_b)]
+    phase_specs: list[dict[str, Any]] = []
+    idx = 0
+    for chunk_idx in range(n_chunks):
+        for letter, target_name, loaders in targets_info:
+            phase_specs.append(
+                {
+                    "index": idx,
+                    "label": f"phase_c{chunk_idx:02d}_target_{letter}",
+                    "target": target_name,
+                    "chunk": chunk_idx,
+                    "loaders": loaders,
+                }
+            )
+            idx += 1
+    phase_labels = [s["label"] for s in phase_specs]
+    n_phases = len(phase_specs)
+    halfway_phase_index = n_phases // 2  # after all targets have completed the first half of their chunks
+
+    start_phase_idx = _first_phase_index_to_run(save_dir, n_phases)
+    all_phases_complete = start_phase_idx >= n_phases
 
     if all_phases_complete:
         if local_rank == 0:
@@ -447,52 +498,23 @@ if __name__ == "__main__":
         if local_rank == 0:
             print(
                 f"DUAL_TARGET resume: starting at phase index {start_phase_idx} "
-                f"({DUAL_TARGET_PHASE_LABELS[start_phase_idx]}) save_dir={save_dir}"
+                f"({phase_labels[start_phase_idx] if start_phase_idx < n_phases else 'N/A'}) "
+                f"save_dir={save_dir} n_chunks={n_chunks} n_phases={n_phases}"
             )
             if start_phase_idx > 0 and not _read_dual_target_state(save_dir):
                 meta = read_latest_checkpoint_meta(save_dir)
                 _write_dual_target_state(
                     save_dir,
                     start_phase_idx,
-                    DUAL_TARGET_PHASE_LABELS[start_phase_idx - 1],
+                    phase_labels[start_phase_idx - 1],
                     int(meta.get("global_step", 0)),
+                    phase_labels,
                 )
     dist.barrier()
 
     lora_path: str | None = None
     if start_phase_idx > 0:
         lora_path = f"{save_dir}/final"
-
-    phase_specs: list[dict[str, Any]] = [
-        {
-            "index": 0,
-            "label": "phase_1a_first_half_target_A",
-            "target": args.target_a,
-            "half": 0,
-            "loaders": loop_a,
-        },
-        {
-            "index": 1,
-            "label": "phase_1b_first_half_target_B",
-            "target": args.target_b,
-            "half": 0,
-            "loaders": loop_b,
-        },
-        {
-            "index": 2,
-            "label": "phase_2a_second_half_target_A",
-            "target": args.target_a,
-            "half": 1,
-            "loaders": loop_a,
-        },
-        {
-            "index": 3,
-            "label": "phase_2b_second_half_target_B",
-            "target": args.target_b,
-            "half": 1,
-            "loaders": loop_b,
-        },
-    ]
 
     for spec in phase_specs:
         idx = int(spec["index"])
@@ -509,7 +531,8 @@ if __name__ == "__main__":
                 wandb_suffix=args.wandb_suffix,
             ),
             target_model_name=spec["target"],
-            which_half=int(spec["half"]),
+            chunk_index=int(spec["chunk"]),
+            n_chunks=n_chunks,
             load_lora_path=phase_load_lora,
             phase_label=str(spec["label"]),
             loop_dataset_loaders=spec["loaders"],
@@ -526,10 +549,11 @@ if __name__ == "__main__":
             save_steps=args.save_steps,
             layer_percents=args.layer_percents,
             phase_index=idx,
+            phase_labels=phase_labels,
         )
         lora_path = f"{save_dir}/final"
 
-        if idx == 1:
+        if idx + 1 == halfway_phase_index:
             if local_rank == 0:
                 print("\n" + "=" * 88)
                 print(MILESTONE_LOG_LINE)
@@ -540,6 +564,7 @@ if __name__ == "__main__":
                     f.write(f"target_a={args.target_a}\n")
                     f.write(f"target_b={args.target_b}\n")
                     f.write(f"oracle={args.oracle_model_name}\n")
+                    f.write(f"n_chunks={n_chunks}\n")
             dist.barrier()
 
     # ── Final eval on both targets ────────────────────────────────────────

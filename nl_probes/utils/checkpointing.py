@@ -56,6 +56,46 @@ def find_latest_checkpoint(save_dir: str) -> str | None:
     return None
 
 
+def _cleanup_old_checkpoints(
+    save_dir: str,
+    tag: str,
+    just_saved_path: str,
+    keep_last_n: int = 1,
+) -> None:
+    """Delete older checkpoints sharing ``tag``, keeping only the ``keep_last_n`` most
+    recent ones (the checkpoint that was just saved always counts as the most recent).
+
+    Only touches files matching ``checkpoint_{tag}_*.pth`` so, e.g., cleaning up
+    "step" checkpoints never removes "epoch" checkpoints and vice versa. Deletion is
+    best-effort: failures are logged, not raised, so a cleanup hiccup never masks a
+    checkpoint that was already saved successfully.
+    """
+    if keep_last_n < 1:
+        keep_last_n = 1
+
+    p = Path(save_dir)
+    candidates = list(p.glob(f"checkpoint_{tag}_*.pth"))
+    try:
+        candidates.sort(key=_checkpoint_step_number)
+    except ValueError:
+        # Fall back to mtime if a filename doesn't match the expected numeric suffix.
+        candidates.sort(key=lambda x: x.stat().st_mtime)
+
+    just_saved_resolved = str(Path(just_saved_path).resolve())
+    others = [c for c in candidates if str(c.resolve()) != just_saved_resolved]
+
+    n_old_to_keep = keep_last_n - 1
+    to_delete = others[:-n_old_to_keep] if n_old_to_keep > 0 else others
+
+    for old_ckpt in to_delete:
+        try:
+            old_ckpt.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"[checkpointing] Warning: failed to delete old checkpoint {old_ckpt}: {e}")
+
+
 def save_checkpoint(
     save_dir: str,
     model: torch.nn.Module,
@@ -67,6 +107,7 @@ def save_checkpoint(
     extra: dict | None = None,
     tag: str = "step",
     module_states: dict[str, dict[str, Any]] | None = None,
+    keep_last_n: int = 1,
 ) -> str:
     os.makedirs(save_dir, exist_ok=True)
     filename = f"checkpoint_{tag}_{global_step if tag == 'step' else epoch}.pth"
@@ -85,6 +126,7 @@ def save_checkpoint(
         ckpt["rng_state"] = rng_state
 
     atomic_save(ckpt, path)
+    _cleanup_old_checkpoints(save_dir, tag, path, keep_last_n=keep_last_n)
     return path
 
 
