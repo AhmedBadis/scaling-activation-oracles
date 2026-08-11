@@ -3,9 +3,9 @@
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --job-name=train-sequential-o1.7t4T4
-#SBATCH --output=logs/train-sequential-o1.7t4T4/%j.out
-#SBATCH --error=logs/train-sequential-o1.7t4T4/%j.err
+#SBATCH --job-name=train-sequential-dual-o1.7t4T4
+#SBATCH --output=logs/train-sequential-dual-o1.7t4T4/%j.out
+#SBATCH --error=logs/train-sequential-dual-o1.7t4T4/%j.err
 
 # Trains one oracle on two targets in four phases (see nl_probes/train_dual_target.py).
 
@@ -15,7 +15,7 @@ nvidia-smi -L
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 cd "$HOME/activation_oracles"
-mkdir -p logs/train-sequential-o1.7t4T4
+mkdir -p logs/train-sequential-dual-o1.7t4T4
 source .venv/bin/activate
 
 python -c "from huggingface_hub import login; login(token='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')"

@@ -25,8 +25,12 @@ from it automatically).
 Target C defaults to ``Qwen/Qwen2.5-4B-Instruct`` (same hidden_size=2560 as Qwen3-4B / Qwen3.5-4B,
 so the shared activation projector applies without modification).
 
-**Shared projector constraint:** all three targets must have the same ``hidden_size`` as each other.
-A mismatch raises a ``ValueError`` at startup rather than silently producing wrong results.
+**Projection note (current ``train_model`` API):** each target now gets its own
+``activation_projector`` checkpoint key, derived from the target model's name via
+``activation_projector_key``. Target A, B, and C therefore each learn an independent
+``target_hidden -> oracle_hidden`` linear map, even when their hidden sizes differ. Checkpoints
+merge all previously-known per-target projector states on every save, so round-robining between
+targets across phases no longer resets the other target's projector.
 
 Models are loaded one at a time (each phase loads a single target; eval loads one target,
 evaluates, then frees it before loading the next), so peak VRAM is no higher than dual-target.
@@ -46,8 +50,9 @@ import torch.distributed as dist
 from transformers import BitsAndBytesConfig
 
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig, namespaced_save_dir
-from nl_probes.sft import _ensure_datasets_exist, build_datasets, build_loader_groups, train_model
+from nl_probes.sft import _ensure_datasets_exist, build_datasets, build_loader_groups, train_model, activation_projector_key
 from nl_probes.utils.checkpointing import read_latest_checkpoint_meta
+from nl_probes.utils.lora_utils import sanitize_lora_name
 from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.hf_config import pretrained_hidden_size
 from nl_probes.utils.activation_utils import get_hf_submodule
@@ -322,8 +327,6 @@ def _eval_classification(
         dist.barrier()
         return {}
 
-    from nl_probes.utils.lora_utils import sanitize_lora_name
-
     oracle_model = load_model(cfg.oracle_model_name, dtype, **{**model_kwargs, "device_map": {"": f"cuda:{local_rank}"}})
     target_model = load_model(target_model_name, dtype, **{**model_kwargs, "device_map": {"": f"cuda:{local_rank}"}})
     target_model.eval()
@@ -341,10 +344,19 @@ def _eval_classification(
     projector = None
     if target_width != oracle_width:
         import glob as _glob
-        pths = sorted(_glob.glob(os.path.join(cfg.save_dir, "checkpoint_step_*.pth")))
-        if pths:
-            ckpt = torch.load(pths[-1], map_location=device, weights_only=False)
-            proj_sd = ckpt["module_states"]["activation_projector"]
+        proj_key = activation_projector_key(target_model_name)
+        pths = sorted(_glob.glob(os.path.join(cfg.save_dir, "checkpoint_step_*.pth")), reverse=True)
+        proj_sd = None
+        for pth in pths:
+            ckpt = torch.load(pth, map_location=device, weights_only=False)
+            module_states = ckpt.get("module_states") or {}
+            if proj_key in module_states:
+                proj_sd = module_states[proj_key]
+                break
+            if "activation_projector" in module_states:  # legacy shared-projector fallback
+                proj_sd = module_states["activation_projector"]
+                break
+        if proj_sd is not None:
             has_bias = "bias" in proj_sd
             projector = torch.nn.Linear(target_width, oracle_width, bias=has_bias, device=device, dtype=dtype)
             projector.load_state_dict(proj_sd)
@@ -397,9 +409,10 @@ if __name__ == "__main__":
     wc = pretrained_hidden_size(args.target_c)
     mismatches = {args.target_a: wa, args.target_b: wb, args.target_c: wc}
     if len(set(mismatches.values())) > 1:
-        raise ValueError(
-            f"All three targets must share the same hidden_size. Got: {mismatches}. "
-            "This training entrypoint shares one activation projector across targets."
+        print(
+            f"target_a ({args.target_a}) hidden_size={wa} != target_b ({args.target_b}) hidden_size={wb} != target_c ({args.target_c}) hidden_size={wc}. "
+            "Each target now trains its own activation_projector (keyed via activation_projector_key), "
+            "so differing hidden sizes across targets are supported."
         )
 
     dist.init_process_group(backend="nccl", timeout=timedelta(hours=2))

@@ -3,9 +3,9 @@
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --job-name=train-phased-o1.7t4T4t4i
-#SBATCH --output=logs/train-phased-o1.7t4T4t4i/%j.out
-#SBATCH --error=logs/train-phased-o1.7t4T4t4i/%j.err
+#SBATCH --job-name=train-phased-triple-o1.7t4T4t4i
+#SBATCH --output=logs/train-phased-triple-o1.7t4T4t4i/%j.out
+#SBATCH --error=logs/train-phased-triple-o1.7t4T4t4i/%j.err
 
 # Trains one oracle on three targets in six phases (see nl_probes/train_phased_triple_target.py).
 # Phase order: 1a (first half A) → 1b (first half B) → 1c (first half C)
@@ -18,7 +18,7 @@ nvidia-smi -L
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 cd "$HOME/activation_oracles"
-mkdir -p logs/train-phased-o1.7t4T4t4i
+mkdir -p logs/train-phased-triple-o1.7t4T4t4i
 source .venv/bin/activate
 
 python -c "from huggingface_hub import login; login(token='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')"

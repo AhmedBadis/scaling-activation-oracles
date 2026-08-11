@@ -113,6 +113,16 @@ def save_checkpoint(
     filename = f"checkpoint_{tag}_{global_step if tag == 'step' else epoch}.pth"
     path = os.path.join(save_dir, filename)
 
+    merged_module_states: dict[str, dict[str, Any]] = {}
+    prev_ckpt_path = find_latest_checkpoint(save_dir)
+    if prev_ckpt_path is not None:
+        try:
+            prev_ckpt = torch.load(prev_ckpt_path, map_location="cpu", weights_only=False)
+            merged_module_states.update(prev_ckpt.get("module_states") or {})
+        except Exception as e:
+            print(f"[checkpointing] Warning: failed to load previous module_states for merge: {e}")
+    merged_module_states.update(module_states or {})
+
     ckpt = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
@@ -120,7 +130,7 @@ def save_checkpoint(
         "global_step": global_step,
         "epoch": epoch,
         "extra": extra or {},
-        "module_states": module_states or {},
+        "module_states": merged_module_states,
     }
     if rng_state is not None:
         ckpt["rng_state"] = rng_state

@@ -61,6 +61,13 @@ from nl_probes.utils.checkpointing import (
     load_checkpoint_if_exists,
     save_checkpoint,
 )
+from nl_probes.utils.lora_utils import sanitize_lora_name
+
+
+def activation_projector_key(target_model_name: str) -> str:
+    """Per-target checkpoint key so each target gets its own activation_projector
+    instead of all targets sharing one 'activation_projector' key."""
+    return f"activation_projector__{sanitize_lora_name(target_model_name)}"
 
 
 def push_lora_to_hf(
@@ -421,6 +428,7 @@ def train_model(
 
     target_width = activation_model.config.hidden_size
     oracle_width = model.config.hidden_size
+    projector_key = activation_projector_key(cfg.target_model_name)
     activation_projector: torch.nn.Module | None = None
     if target_width != oracle_width:
         activation_projector = torch.nn.Linear(
@@ -552,7 +560,7 @@ def train_model(
     global_step = 0
     start_epoch = 0
 
-    modules_to_restore = {"activation_projector": activation_projector} if activation_projector is not None else None
+    modules_to_restore = {projector_key: activation_projector} if activation_projector is not None else None
     ckpt_global_step, ckpt_epoch, ckpt_extra = load_checkpoint_if_exists(
         cfg.save_dir,
         model,
@@ -632,7 +640,7 @@ def train_model(
                     extra=_dual_target_ckpt_extra() if dual_target_phase_label else {"signal": signum},
                     tag="step",
                     module_states=(
-                        {"activation_projector": activation_projector.state_dict()}
+                        {projector_key: activation_projector.state_dict()}
                         if activation_projector is not None
                         else None
                     ),
@@ -704,7 +712,7 @@ def train_model(
                     rng_state=rng,
                     tag="epoch",
                     module_states=(
-                        {"activation_projector": activation_projector.state_dict()}
+                        {projector_key: activation_projector.state_dict()}
                         if activation_projector is not None
                         else None
                     ),
@@ -798,7 +806,7 @@ def train_model(
                             extra=_dual_target_ckpt_extra() if dual_target_phase_label else None,
                             tag="step",
                             module_states=(
-                                {"activation_projector": activation_projector.state_dict()}
+                                {projector_key: activation_projector.state_dict()}
                                 if activation_projector is not None
                                 else None
                             ),
@@ -824,7 +832,7 @@ def train_model(
                     rng_state=rng,
                     tag="epoch",
                     module_states=(
-                        {"activation_projector": activation_projector.state_dict()}
+                        {projector_key: activation_projector.state_dict()}
                         if activation_projector is not None
                         else None
                     ),
@@ -850,7 +858,7 @@ def train_model(
                 tag="step",
                 extra=extra,
                 module_states=(
-                    {"activation_projector": activation_projector.state_dict()}
+                    {projector_key: activation_projector.state_dict()}
                     if activation_projector is not None
                     else None
                 ),
