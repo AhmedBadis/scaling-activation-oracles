@@ -2,15 +2,17 @@
 OOD classification evaluation for trained oracle LoRAs.
 
 Evaluates each oracle from the manifest on classification datasets that were
-NOT seen during training (engels_* datasets). Handles both same-model and
-cross-model (oracle != activation model) setups with projector loading.
+NOT seen during training (engels_* datasets). Handles same-model, cross-model
+(oracle != activation model), and multi-target (dual/triple-target trained
+oracle, evaluated against each of its targets separately) setups, including
+projector loading.
 
 Run:
     python experiments/ood_classification_eval.py
 or via Slurm:
     sbatch runner/ood_classification_eval.sbatch
 
-Output: experiments/ood_classification_eval/{oracle_id}/results.json
+Output: experiments/ood_classification_eval/{oracle_id}/{target_tag}/results.json
 Summarize: python experiments/summarize_ood_classification_eval.py
 """
 
@@ -19,6 +21,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -68,49 +71,65 @@ OOD_DATASETS: dict[str, dict[str, Any]] = {
 
 # ---------------------------------------------------------------------------
 # Oracle manifest  (same as oracle_ood_eval.py)
+#
+# `activation_model_names` is a LIST because a single trained oracle LoRA
+# (+ single shared projector, when one exists) can be evaluated against
+# every target it was trained on. The dual/triple-target training scripts
+# already enforce that co-trained targets share one hidden width (so one
+# projector is valid for all of them) -- see train_phased_dual_target.py's
+# startup check comparing pretrained_hidden_size(target_a/b/c). We reuse
+# that guarantee here: one oracle load + one LoRA load + one projector load
+# per manifest row, looped over N activation models for eval/scoring only.
 # ---------------------------------------------------------------------------
 ORACLE_MANIFEST: list[dict[str, Any]] = [
     {
-        "id": "o1.7-t4-proj",
+        "id": "o1.7-t4",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
-        "activation_model_name": "Qwen/Qwen3-4B",
+        "activation_model_names": ["Qwen/Qwen3-4B"],
         "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3-4B/final",
         "projector_save_dir": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3-4B",
     },
     {
         "id": "o1.7-t1.7",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
-        "activation_model_name": "Qwen/Qwen3-1.7B",
+        "activation_model_names": ["Qwen/Qwen3-1.7B"],
         "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3-1.7B/final",
         "projector_save_dir": "",
     },
     {
-        "id": "o1.7-t3.5-4B",
+        "id": "o1.7-T4",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
-        "activation_model_name": "Qwen/Qwen3.5-4B",
+        "activation_model_names": ["Qwen/Qwen3.5-4B"],
         "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3.5-4B/final",
         "projector_save_dir": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-1.7B_target_Qwen3.5-4B",
     },
     {
         "id": "o4-t4",
         "oracle_model_name": "Qwen/Qwen3-4B",
-        "activation_model_name": "Qwen/Qwen3-4B",
+        "activation_model_names": ["Qwen/Qwen3-4B"],
         "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3-4B_target_Qwen3-4B/final",
         "projector_save_dir": "",
     },
     {
-        "id": "O3.5-t3-4B",
+        "id": "O4-t4",
         "oracle_model_name": "Qwen/Qwen3.5-4B",
-        "activation_model_name": "Qwen/Qwen3-4B",
+        "activation_model_names": ["Qwen/Qwen3-4B"],
         "verbalizer_lora": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3.5-4B_target_Qwen3-4B/final",
         "projector_save_dir": "checkpoints_latentqa_cls_past_lens_oracle_Qwen3.5-4B_target_Qwen3-4B",
     },
     {
         "id": "o1.7-dual-t4-T4",
         "oracle_model_name": "Qwen/Qwen3-1.7B",
-        "activation_model_name": "Qwen/Qwen3-4B",
+        "activation_model_names": ["Qwen/Qwen3-4B", "Qwen/Qwen3.5-4B"],
         "verbalizer_lora": "checkpoints_phased_dual_o1.7_t4_T4/final",
         "projector_save_dir": "checkpoints_phased_dual_o1.7_t4_T4",
+    },
+    {
+        "id": "o1.7-triple-t4-T4-t4i",
+        "oracle_model_name": "Qwen/Qwen3-1.7B",
+        "activation_model_names": ["Qwen/Qwen3-4B", "Qwen/Qwen3.5-4B", "Qwen/Qwen3-4B-Instruct-2507"],
+        "verbalizer_lora": "checkpoints_phased_triple_o1.7_t4T4t4i/final",     
+        "projector_save_dir": "checkpoints_phased_triple_o1.7_t4T4t4i",
     },
 ]
 
@@ -134,6 +153,11 @@ def _resolve(p: str) -> str:
     if not p or p.startswith("/"):
         return p
     return str(REPO_ROOT / p)
+
+
+def _target_tag(model_name: str) -> str:
+    """Filesystem-safe label for a target model, used as an output subdir."""
+    return model_name.replace("/", "__")
 
 
 def _get_model_kwargs(model_name: str) -> dict:
@@ -236,6 +260,95 @@ def _load_ood_eval_data(
     return eval_data
 
 
+def _eval_one_target(
+    *,
+    oid: str,
+    o_name: str,
+    a_name: str,
+    o_model,
+    o_tok,
+    a_model,
+    a_tok,
+    a_kwargs: dict,
+    submodule,
+    lora_san: str,
+    projector: torch.nn.Module | None,
+    out_dir: Path,
+) -> None:
+    """Run the full layer x dataset eval sweep for one (oracle, target) pair
+    and write its own results.json under out_dir."""
+    all_records: list[dict] = []
+
+    for layer_percent in LAYER_PERCENTS:
+        _banner(oracle=oid, target=a_name, status="loading_data", layer_percent=str(layer_percent))
+        eval_data = _load_ood_eval_data(o_name, a_name, a_model, a_kwargs, layer_percent)
+
+        for ds_id, data in eval_data.items():
+            if not data:
+                _banner(oracle=oid, target=a_name, ds=ds_id, layer=str(layer_percent), status="empty_skip")
+                continue
+
+            raw = run_evaluation(
+                eval_data=data,
+                model=o_model,
+                tokenizer=o_tok,
+                submodule=submodule,
+                device=torch.device("cuda"),
+                dtype=DTYPE,
+                global_step=-1,
+                lora_path=lora_san,
+                eval_batch_size=EVAL_BATCH_SIZE,
+                steering_coefficient=STEERING_COEFFICIENT,
+                generation_kwargs=GENERATION_KWARGS,
+                activation_tokenizer=a_tok,
+                activation_model=a_model,
+                projection_module=projector,
+            )
+
+            _fmt, acc = score_eval_responses(raw, data)
+            _banner(
+                oracle=oid,
+                target=a_name,
+                ds=ds_id,
+                layer=str(layer_percent),
+                acc=f"{acc:.4f}",
+                fmt=f"{_fmt:.4f}",
+            )
+
+            for result, dp in zip(raw, data, strict=True):
+                all_records.append(
+                    {
+                        "layer_percent": layer_percent,
+                        "dataset_id": ds_id,
+                        "ground_truth": result.api_response,
+                        "target": dp.target_output,
+                    }
+                )
+
+    target_dir = out_dir / _target_tag(a_name)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out_path = target_dir / "results.json"
+    out_path.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "oracle_label": oid,
+                    "oracle_model": o_name,
+                    "target_model": a_name,
+                    "cross_model": o_name != a_name,
+                    "layer_percents": LAYER_PERCENTS,
+                    "single_token_mode": SINGLE_TOKEN_MODE,
+                    "generation_kwargs": GENERATION_KWARGS,
+                },
+                "records": all_records,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _banner(oracle=oid, target=a_name, status="saved", path=str(out_path))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -243,13 +356,21 @@ def _load_ood_eval_data(
 def main() -> None:
     EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    failures: list[str] = []
+
     for row in ORACLE_MANIFEST:
         oid = row["id"]
         o_name = row["oracle_model_name"]
-        a_name = row.get("activation_model_name", o_name)
+
+        # Backward-compatible: accept either the old singular key or the new
+        # list key, so hand-edited manifests from before this change still work.
+        if "activation_model_names" in row:
+            a_names = list(row["activation_model_names"])
+        else:
+            a_names = [row.get("activation_model_name", o_name)]
+
         verbal = _resolve(row.get("verbalizer_lora", ""))
         proj_dir = _resolve(row.get("projector_save_dir", ""))
-        cross = o_name != a_name
 
         # --- validation ---
         if not verbal:
@@ -258,120 +379,117 @@ def main() -> None:
         if not Path(verbal).exists():
             _banner(oracle=oid, status="skip", reason="verbalizer_lora_not_found", path=verbal)
             continue
+        if not a_names:
+            _banner(oracle=oid, status="skip", reason="activation_model_names_empty")
+            continue
+
+        # A single shared projector is only valid across all listed targets
+        # if they all share one hidden width (the same constraint the
+        # dual/triple-target training scripts enforce at start-up). Fail
+        # fast here rather than silently mis-projecting a subset of targets.
+        try:
+            act_widths = {a: pretrained_hidden_size(a) for a in a_names}
+        except Exception:
+            _banner(oracle=oid, status="skip", reason="pretrained_hidden_size_lookup_failed")
+            traceback.print_exc()
+            failures.append(oid)
+            continue
+        if len(set(act_widths.values())) > 1:
+            _banner(
+                oracle=oid,
+                status="skip",
+                reason="activation_model_names_hidden_size_mismatch",
+                widths=str(act_widths),
+            )
+            continue
 
         out_dir = EXPERIMENTS_DIR / oid
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        _banner(oracle=oid, status="start", o_model=o_name, a_model=a_name, cross=str(cross))
+        _banner(oracle=oid, status="start", o_model=o_name, targets=",".join(a_names))
 
-        o_kwargs = _get_model_kwargs(o_name)
-        a_kwargs = _get_model_kwargs(a_name)
+        # Everything from here on touches the GPU / filesystem / network
+        # (model loads, checkpoint loads, generation). Any one row failing
+        # -- OOM on a big cross-model pair, a missing/partial checkpoint for
+        # a target added later (e.g. the triple-target run), a flaky model
+        # download -- must NOT abort the whole manifest loop and skip every
+        # row that comes after it (this is what silently dropped dual's
+        # second target and the whole triple row previously: one uncaught
+        # exception here propagated out of main() and killed the process).
+        o_model = None
+        try:
+            o_kwargs = _get_model_kwargs(o_name)
 
-        # load projector first (before models occupy VRAM)
-        if cross:
-            projector = _load_projector(o_name, a_name, proj_dir)
-        else:
-            projector = None
+            # Projector depends only on (oracle hidden size, shared target
+            # hidden size), so it is loaded once per row and reused across
+            # every target.
+            any_cross = any(a != o_name for a in a_names)
+            projector = _load_projector(o_name, a_names[0], proj_dir) if any_cross else None
 
-        # load oracle model
-        o_model = load_model(o_name, DTYPE, **o_kwargs)
-        o_model.eval()
-        o_model.add_adapter(LoraConfig(target_modules="all-linear"), adapter_name="default")
-        o_tok = load_tokenizer(o_name)
-        submodule = get_hf_submodule(o_model, INJECTION_LAYER)
+            # load oracle model + LoRA once for the whole row
+            o_model = load_model(o_name, DTYPE, **o_kwargs)
+            o_model.eval()
+            o_model.add_adapter(LoraConfig(target_modules="all-linear"), adapter_name="default")
+            o_tok = load_tokenizer(o_name)
+            submodule = get_hf_submodule(o_model, INJECTION_LAYER)
 
-        # load activation model (may be same object)
-        if cross:
-            a_model = load_model(a_name, DTYPE, **a_kwargs)
-            a_model.eval()
-            a_tok = load_tokenizer(a_name)
-        else:
-            a_model = o_model
-            a_tok = o_tok
+            lora_san = sanitize_lora_name(verbal)
+            o_model.load_adapter(verbal, adapter_name=lora_san, is_trainable=False)
+            o_model.set_adapter(lora_san)
 
-        lora_san = sanitize_lora_name(verbal)
-        o_model.load_adapter(verbal, adapter_name=lora_san, is_trainable=False)
-        o_model.set_adapter(lora_san)
+            for a_name in a_names:
+                cross = a_name != o_name
+                a_kwargs = _get_model_kwargs(a_name)
+                a_model = None
+                try:
+                    if cross:
+                        a_model = load_model(a_name, DTYPE, **a_kwargs)
+                        a_model.eval()
+                        a_tok = load_tokenizer(a_name)
+                    else:
+                        a_model = o_model
+                        a_tok = o_tok
 
-        all_records: list[dict] = []
-
-        for layer_percent in LAYER_PERCENTS:
-            _banner(oracle=oid, status="loading_data", layer_percent=str(layer_percent))
-            eval_data = _load_ood_eval_data(o_name, a_name, a_model, a_kwargs, layer_percent)
-
-            for ds_id, data in eval_data.items():
-                if not data:
-                    _banner(oracle=oid, ds=ds_id, layer=str(layer_percent), status="empty_skip")
-                    continue
-
-                raw = run_evaluation(
-                    eval_data=data,
-                    model=o_model,
-                    tokenizer=o_tok,
-                    submodule=submodule,
-                    device=torch.device("cuda"),
-                    dtype=DTYPE,
-                    global_step=-1,
-                    lora_path=lora_san,
-                    eval_batch_size=EVAL_BATCH_SIZE,
-                    steering_coefficient=STEERING_COEFFICIENT,
-                    generation_kwargs=GENERATION_KWARGS,
-                    activation_tokenizer=a_tok,
-                    activation_model=a_model,
-                    projection_module=projector,
-                )
-
-                _fmt, acc = score_eval_responses(raw, data)
-                _banner(
-                    oracle=oid,
-                    ds=ds_id,
-                    layer=str(layer_percent),
-                    acc=f"{acc:.4f}",
-                    fmt=f"{_fmt:.4f}",
-                )
-
-                for result, dp in zip(raw, data, strict=True):
-                    all_records.append(
-                        {
-                            "layer_percent": layer_percent,
-                            "dataset_id": ds_id,
-                            "ground_truth": result.api_response,
-                            "target": dp.target_output,
-                        }
+                    _eval_one_target(
+                        oid=oid,
+                        o_name=o_name,
+                        a_name=a_name,
+                        o_model=o_model,
+                        o_tok=o_tok,
+                        a_model=a_model,
+                        a_tok=a_tok,
+                        a_kwargs=a_kwargs,
+                        submodule=submodule,
+                        lora_san=lora_san,
+                        projector=projector,
+                        out_dir=out_dir,
                     )
+                except Exception:
+                    _banner(oracle=oid, target=a_name, status="error", action="skipping_target")
+                    traceback.print_exc()
+                    failures.append(f"{oid}:{a_name}")
+                finally:
+                    if cross and a_model is not None:
+                        del a_model
+                        gc.collect()
+                        torch.cuda.empty_cache()
+        except Exception:
+            _banner(oracle=oid, status="error", action="skipping_row")
+            traceback.print_exc()
+            failures.append(oid)
+        finally:
+            # cleanup for the row, regardless of success/failure above
+            if o_model is not None:
+                if lora_san in getattr(o_model, "peft_config", {}):
+                    o_model.delete_adapter(lora_san)
+                del o_model
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        out_path = out_dir / "results.json"
-        out_path.write_text(
-            json.dumps(
-                {
-                    "meta": {
-                        "oracle_label": oid,
-                        "oracle_model": o_name,
-                        "target_model": a_name,
-                        "verbalizer_lora": verbal,
-                        "cross_model": cross,
-                        "layer_percents": LAYER_PERCENTS,
-                        "single_token_mode": SINGLE_TOKEN_MODE,
-                        "generation_kwargs": GENERATION_KWARGS,
-                    },
-                    "records": all_records,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        _banner(oracle=oid, status="saved", path=str(out_path))
-
-        # cleanup
-        if lora_san in o_model.peft_config:
-            o_model.delete_adapter(lora_san)
-        if cross:
-            del a_model
-        del o_model
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    _banner(status="done")
+    if failures:
+        _banner(status="done_with_failures", failed=",".join(failures))
+    else:
+        _banner(status="done")
 
 
 if __name__ == "__main__":

@@ -7,9 +7,7 @@
 #SBATCH --output=logs/train-phased-triple-o1.7t4T4t4i/%j.out
 #SBATCH --error=logs/train-phased-triple-o1.7t4T4t4i/%j.err
 
-# Trains one oracle on three targets in six phases (see nl_probes/train_phased_triple_target.py).
-# Phase order: 1a (first half A) → 1b (first half B) → 1c (first half C)
-#           → 2a (second half A) → 2b (second half B) → 2c (second half C)
+# Trains one oracle on three targets in 16 x 3 phases (see nl_probes/train_phased_triple_target.py).
 # Target C defaults to Qwen/Qwen3-4B-Instruct-2507 (same hidden_size=2560 as A and B).
 
 module load Python/3.11.3-GCCcore-12.3.0
