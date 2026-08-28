@@ -70,6 +70,94 @@ def activation_projector_key(target_model_name: str) -> str:
     return f"activation_projector__{sanitize_lora_name(target_model_name)}"
 
 
+class GatedResidualMLPProjector(torch.nn.Module):
+    """Stable nonlinear target-to-oracle activation projector.
+
+    The learned linear path preserves the original projector's global alignment. A
+    zero-initialized residual MLP learns nonlinear corrections without changing the
+    initial function at startup.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        bias: bool = True,
+        hidden_dim: int | None = None,
+        residual_scale_init: float = 1e-2,
+        eps: float = 1e-6,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = max(512, min(2048, 2 * min(input_dim, output_dim) // 3))
+
+        self.base = torch.nn.Linear(input_dim, output_dim, bias=bias, device=device, dtype=dtype)
+        self.down = torch.nn.Linear(input_dim, hidden_dim, bias=True, device=device, dtype=dtype)
+        self.norm = torch.nn.RMSNorm(hidden_dim, eps=eps, device=device, dtype=dtype)
+        self.up = torch.nn.Linear(hidden_dim, output_dim, bias=False, device=device, dtype=dtype)
+        self.residual_scale = torch.nn.Parameter(
+            torch.tensor(residual_scale_init, device=device, dtype=dtype)
+        )
+
+        # Start exactly as the established linear projector; the residual branch is
+        # enabled smoothly as its zero-initialized output weights learn.
+        torch.nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.residual_scale * self.up(
+            torch.nn.functional.silu(self.norm(self.down(x)))
+        )
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Migrate legacy checkpoints containing only Linear.weight/bias. The new
+        # residual branch remains at its safe startup initialization.
+        legacy_weight = prefix + "weight"
+        legacy_bias = prefix + "bias"
+        new_weight = prefix + "base.weight"
+        new_bias = prefix + "base.bias"
+        if legacy_weight in state_dict and new_weight not in state_dict:
+            state_dict[new_weight] = state_dict.pop(legacy_weight)
+            if self.base.bias is not None and legacy_bias in state_dict:
+                state_dict[new_bias] = state_dict.pop(legacy_bias)
+            for name, value in self.state_dict().items():
+                key = prefix + name
+                if key not in state_dict:
+                    state_dict[key] = value.detach().clone()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+
+def make_activation_projector(
+    input_dim: int,
+    output_dim: int,
+    *,
+    bias: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> GatedResidualMLPProjector:
+    return GatedResidualMLPProjector(
+        input_dim,
+        output_dim,
+        bias=bias,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _sync_module_grads(module: torch.nn.Module | None, world_size: int) -> None:
+    """Average gradients for trainable modules that are not wrapped in DDP."""
+    if module is None:
+        return
+    for parameter in module.parameters():
+        if parameter.grad is not None:
+            dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
+            parameter.grad.div_(world_size)
+
+
 def push_lora_to_hf(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -331,7 +419,10 @@ def oom_preflight_check(
     long_prompts = materialize_missing_steering_vectors(long_prompts, activation_tokenizer, activation_model)
     largest_possible_batch = construct_batch(long_prompts, tokenizer, device)
 
-    dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
+    dummy_optimizer_params = list(model.parameters())
+    if projection_module is not None:
+        dummy_optimizer_params.extend(projection_module.parameters())
+    dummy_optimizer = torch.optim.AdamW(dummy_optimizer_params, lr=0.0)
 
     for _ in tqdm(range(3), desc="OOM preflight check"):
         loss = train_features_batch(
@@ -431,7 +522,7 @@ def train_model(
     projector_key = activation_projector_key(cfg.target_model_name)
     activation_projector: torch.nn.Module | None = None
     if target_width != oracle_width:
-        activation_projector = torch.nn.Linear(
+        activation_projector = make_activation_projector(
             target_width,
             oracle_width,
             bias=cfg.activation_projection_bias,
@@ -758,7 +849,12 @@ def train_model(
             is_update_step = (step_idx + 1) % cfg.gradient_accumulation_steps == 0
 
             if is_update_step:
-                clip_grad_norm_(train_model_module.parameters(), cfg.max_grad_norm)
+                _sync_module_grads(activation_projector, world_size)
+                clip_grad_norm_(
+                    list(train_model_module.parameters())
+                    + (list(activation_projector.parameters()) if activation_projector is not None else []),
+                    cfg.max_grad_norm,
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()

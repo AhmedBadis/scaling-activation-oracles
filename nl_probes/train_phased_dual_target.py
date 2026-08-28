@@ -45,7 +45,14 @@ import torch.distributed as dist
 from transformers import BitsAndBytesConfig
 
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig, namespaced_save_dir
-from nl_probes.sft import _ensure_datasets_exist, build_datasets, build_loader_groups, train_model, activation_projector_key
+from nl_probes.sft import (
+    _ensure_datasets_exist,
+    activation_projector_key,
+    build_datasets,
+    build_loader_groups,
+    make_activation_projector,
+    train_model,
+)
 from nl_probes.utils.checkpointing import read_latest_checkpoint_meta
 from nl_probes.utils.lora_utils import sanitize_lora_name
 from nl_probes.utils.common import load_model, load_tokenizer
@@ -382,8 +389,17 @@ def _eval_classification(
                 proj_sd = module_states["activation_projector"]
                 break
         if proj_sd is not None:
-            has_bias = "bias" in proj_sd
-            projector = torch.nn.Linear(target_width, oracle_width, bias=has_bias, device=device, dtype=dtype)
+            # New checkpoints use the gated residual MLP projector. Legacy linear
+            # checkpoints are migrated by the module's state-dict loader; infer bias
+            # from either the legacy or new key layout.
+            has_bias = "base.bias" in proj_sd or "bias" in proj_sd
+            projector = make_activation_projector(
+                target_width,
+                oracle_width,
+                bias=has_bias,
+                device=device,
+                dtype=dtype,
+            )
             projector.load_state_dict(proj_sd)
             projector.eval()
 
