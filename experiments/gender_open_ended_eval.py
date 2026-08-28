@@ -14,7 +14,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import VerbalizerInputInfo, VerbalizerResults
-from nl_probes.utils.lora_utils import secret_targets_gender
 from nl_probes.utils.common import load_model, load_tokenizer
 
 if __name__ == "__main__":
@@ -37,7 +36,6 @@ if __name__ == "__main__":
         "male",
         "female",
     ]
-    target_lora_path_by_suffix: dict[str, str] | None = None
 
     # IMPORTANT: Specify LoRAs for your base model here
     if model_name == "google/gemma-2-9b-it":
@@ -47,28 +45,10 @@ if __name__ == "__main__":
             "adamkarvonen/checkpoints_latentqa_only_addition_gemma-2-9b-it",
             "adamkarvonen/checkpoints_cls_latentqa_only_addition_gemma-2-9b-it",
             "adamkarvonen/checkpoints_cls_only_addition_gemma-2-9b-it",
-            None,
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_1e-6",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-6",
-            # "adamkarvonen/checkpoints_latentqa_only_addition_gemma-2-9b-it",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-5",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_1e-4",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-4",
         ]
         target_lora_path_template = "bcywinski/gemma-2-9b-it-user-{lora_path}"
         segment_start = -10
-    elif model_name in ("Qwen/Qwen3-4B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3.5-4B"):
-        rows = secret_targets_gender(model_name)
-        if not rows:
-            raise ValueError(
-                f"No gender target LoRAs on Hugging Face for {model_name} "
-                "(paper uses gemma-2-9b-it-user-{{male,female}} only)."
-            )
-        verbalizer_lora_paths = [None]
-        target_lora_suffixes = [r["suffix"] for r in rows]
-        target_lora_path_by_suffix = {r["suffix"]: r["lora_hf_or_local"] for r in rows}
-        target_lora_path_template = None
-        segment_start = -10
+
     else:
         raise ValueError(f"Unsupported MODEL_NAME: {model_name}")
 
@@ -88,15 +68,7 @@ if __name__ == "__main__":
         "max_new_tokens": 20,
     }
 
-    config = base_experiment.VerbalizerEvalConfig(
-        model_name=model_name,
-        activation_input_types=["lora"],
-        eval_batch_size=512,
-        verbalizer_generation_kwargs=generation_kwargs,
-        full_seq_repeats=1,
-        segment_repeats=1,
-        segment_start_idx=segment_start,
-    )
+    config = base_experiment.VerbalizerEvalConfig(model_name=model_name, activation_input_types=["lora"], eval_batch_size=512, verbalizer_generation_kwargs=generation_kwargs, full_seq_repeats=1, segment_repeats=1, segment_start_idx=segment_start)
 
     experiments_dir: str = "experiments/gender_results"
     output_json_dir: str = f"{experiments_dir}/{model_name_str}_open_ended_{PROMPT_TYPE}_{DATASET_TYPE}"
@@ -143,7 +115,7 @@ if __name__ == "__main__":
     tokenizer = load_tokenizer(model_name)
 
     print(f"Loading model: {model_name} on {device} with dtype={dtype}")
-    model = load_model(model_name, dtype, attn_implementation="sdpa")
+    model = load_model(model_name, dtype)
     model.eval()
 
     # Add dummy adapter so peft_config exists and we can use the consistent PeftModel API
@@ -163,10 +135,7 @@ if __name__ == "__main__":
         for target_lora_suffix in target_lora_suffixes:
             target_lora_path = None
             if target_lora_suffix is not None:
-                if target_lora_path_by_suffix is not None:
-                    target_lora_path = target_lora_path_by_suffix[target_lora_suffix]
-                else:
-                    target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
+                target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
 
             sanitized_target_name = None
             if target_lora_path is not None:

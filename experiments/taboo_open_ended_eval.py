@@ -1,10 +1,7 @@
-# GRADIENT ACCUMULATION FOR GOOD RESULTS OR RUN TILL END
-
 import os
 
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # Reduce warnings
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import random
 import json
@@ -17,13 +14,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import VerbalizerInputInfo, VerbalizerResults
-from nl_probes.utils.lora_utils import TABOO_SUFFIXES, secret_targets_taboo
 from nl_probes.utils.common import load_model, load_tokenizer
 
 if __name__ == "__main__":
     # Model and dtype
-    # model_name = "Qwen/Qwen3-8B"
-    model_name = "google/gemma-2-9b-it"
+    model_name = "Qwen/Qwen3-8B"
+    # model_name = "google/gemma-2-9b-it"
     model_name_str = model_name.split("/")[-1].replace(".", "_")
 
     random.seed(42)
@@ -36,8 +32,29 @@ if __name__ == "__main__":
 
     # By default we iterate over target_loras and verbalizer_loras
     # target_lora can also be set to None when calling run_verbalizer() to get base model activations
-    target_lora_suffixes = TABOO_SUFFIXES
-    target_lora_path_by_suffix: dict[str, str] | None = None
+    target_lora_suffixes = [
+        "ship",
+        "wave",
+        "song",
+        "snow",
+        "rock",
+        "moon",
+        "jump",
+        "green",
+        "flame",
+        "flag",
+        "dance",
+        "cloud",
+        "clock",
+        "chair",
+        "salt",
+        "book",
+        "blue",
+        # "adversarial",
+        "gold",
+        "leaf",
+        "smile",
+    ]
 
     if model_name == "Qwen/Qwen3-8B":
         verbalizer_lora_paths = [
@@ -55,26 +72,8 @@ if __name__ == "__main__":
             "adamkarvonen/checkpoints_cls_latentqa_only_addition_gemma-2-9b-it",
             "adamkarvonen/checkpoints_latentqa_only_addition_gemma-2-9b-it",
             "adamkarvonen/checkpoints_cls_only_addition_gemma-2-9b-it",
-            None,
-            # "checkpoints_latentqa_cls_past_lens_gemma-2-9b-it_1e-6/final",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_1e-6",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-6",
-            # "adamkarvonen/checkpoints_latentqa_only_addition_gemma-2-9b-it",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-5",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_1e-4",
-            # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-4",
         ]
         target_lora_path_template: Optional[str] = "bcywinski/gemma-2-9b-it-taboo-{lora_path}"
-        segment_start = -10
-    elif model_name in ("Qwen/Qwen3-4B", "Qwen/Qwen3-1.7B"):
-        verbalizer_lora_paths = [None]
-        rows = secret_targets_taboo(model_name)
-        if not rows:
-            raise ValueError(f"No taboo target LoRAs configured for {model_name}")
-        target_lora_suffixes = [r["suffix"] for r in rows]
-        # Per-suffix Hub path (templates differ between 4B and 1.7B).
-        target_lora_path_by_suffix = {r["suffix"]: r["lora_hf_or_local"] for r in rows}
-        target_lora_path_template: Optional[str] = None
         segment_start = -10
     else:
         raise ValueError(f"Unsupported MODEL_NAME: {model_name}")
@@ -98,7 +97,7 @@ if __name__ == "__main__":
     config = base_experiment.VerbalizerEvalConfig(
         model_name=model_name,
         activation_input_types=["lora"],
-        eval_batch_size=8,  # Reduced from 512 to save memory
+        eval_batch_size=512,
         verbalizer_generation_kwargs=generation_kwargs,
         full_seq_repeats=1,
         segment_repeats=1,
@@ -153,14 +152,6 @@ if __name__ == "__main__":
     print(f"Loading model: {model_name} on {device} with dtype={dtype}")
     model = load_model(model_name, dtype)
     model.eval()
-    
-    # Enable memory efficient attention if available
-    if hasattr(model.config, 'use_cache'):
-        model.config.use_cache = False  # Disable cache to save memory
-    
-    # Clear cache after loading
-    torch.cuda.empty_cache()
-    print(f"GPU memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
     # Add dummy adapter so peft_config exists and we can use the consistent PeftModel API
     dummy_config = LoraConfig()
@@ -179,10 +170,7 @@ if __name__ == "__main__":
         for target_lora_suffix in target_lora_suffixes:
             target_lora_path = None
             if target_lora_suffix is not None:
-                if target_lora_path_by_suffix is not None:
-                    target_lora_path = target_lora_path_by_suffix[target_lora_suffix]
-                else:
-                    target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
+                target_lora_path = target_lora_path_template.format(lora_path=target_lora_suffix)
 
             sanitized_target_name = None
             if target_lora_path is not None:
@@ -225,9 +213,6 @@ if __name__ == "__main__":
 
             if sanitized_target_name is not None and sanitized_target_name in model.peft_config:
                 model.delete_adapter(sanitized_target_name)
-            
-            # Clear GPU memory between iterations
-            torch.cuda.empty_cache()
 
             combo_pbar.update(1)
 

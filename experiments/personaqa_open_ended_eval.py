@@ -1,8 +1,7 @@
 import os
 
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"  # Reduce warnings
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
 import torch
@@ -15,13 +14,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 import nl_probes.base_experiment as base_experiment
 from nl_probes.base_experiment import VerbalizerInputInfo, VerbalizerResults
-from nl_probes.utils.lora_utils import secret_targets_personaqa
 from nl_probes.utils.common import load_model, load_tokenizer
 
 if __name__ == "__main__":
     # Model and dtype
     model_names = [
-        # "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-8B",
         "google/gemma-2-9b-it",
         # "meta-llama/Llama-3.3-70B-Instruct",
     ]
@@ -37,7 +35,7 @@ if __name__ == "__main__":
         dtype = torch.bfloat16
         torch.set_grad_enabled(False)
 
-        model_kwargs = {"attn_implementation": "sdpa"}
+        model_kwargs = {}
 
         # By default we iterate over target_loras and verbalizer_loras
         # target_lora can also be set to None when calling run_verbalizer() to get base model activations
@@ -49,13 +47,12 @@ if __name__ == "__main__":
                 # "model_lora/Qwen3-8B-shuffled_1_epochs"
             ]
             verbalizer_lora_paths = [
-                "adamkarvonen/checkpoints_cls_latentqa_past_lens_400k_Qwen3-8B",
-                # "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B",
-                # "adamkarvonen/checkpoints_cls_latentqa_only_addition_Qwen3-8B",
-                # "adamkarvonen/checkpoints_latentqa_only_addition_Qwen3-8B",
-                # "adamkarvonen/checkpoints_cls_only_addition_Qwen3-8B",
-                # "adamkarvonen/checkpoints_cls_latentqa_sae_addition_Qwen3-8B",
-                # None,
+                "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B",
+                "adamkarvonen/checkpoints_cls_latentqa_only_addition_Qwen3-8B",
+                "adamkarvonen/checkpoints_latentqa_only_addition_Qwen3-8B",
+                "adamkarvonen/checkpoints_cls_only_addition_Qwen3-8B",
+                "adamkarvonen/checkpoints_cls_latentqa_sae_addition_Qwen3-8B",
+                None,
             ]
             target_lora_path_template = "{lora_path}"
             segment_start = -20
@@ -65,32 +62,24 @@ if __name__ == "__main__":
                 "adamkarvonen/gemma-2-9b-it-shuffled_3_epochs",
             ]
             verbalizer_lora_paths = [
-                # "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it",
-                # "adamkarvonen/checkpoints_cls_latentqa_only_addition_gemma-2-9b-it",
-                # "adamkarvonen/checkpoints_latentqa_only_addition_gemma-2-9b-it",
-                # "adamkarvonen/checkpoints_cls_only_addition_gemma-2-9b-it",
-                # None,
-                # "checkpoints_latentqa_cls_past_lens_gemma-2-9b-it_1e-6/final",
-                "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_1e-6",
-                "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-6",
+                "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it",
+                "adamkarvonen/checkpoints_cls_latentqa_only_addition_gemma-2-9b-it",
                 "adamkarvonen/checkpoints_latentqa_only_addition_gemma-2-9b-it",
-                "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-5",
-                "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_1e-4",
-                "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-4",
+                "adamkarvonen/checkpoints_cls_only_addition_gemma-2-9b-it",
+                None,
             ]
             target_lora_path_template = "{lora_path}"
             segment_start = -20
 
         elif model_name == "meta-llama/Llama-3.3-70B-Instruct":
             target_lora_suffixes = [
-                "adamkarvonen/Llama-3_3-70B-Instruct-shuffled_3_epochs_v2",
+                "adamkarvonen/Llama-3_3-70B-Instruct-shuffled_3_epochs",
             ]
             verbalizer_lora_paths = [
-                "checkpoints_latentqa_layer_0_Llama-3_3-70B-Instruct/final",
-                # "adamkarvonen/checkpoints_act_cls_latentqa_pretrain_mix_adding_Llama-3_3-70B-Instruct",
-                # "adamkarvonen/checkpoints_latentqa_only_adding_Llama-3_3-70B-Instruct",
-                # "adamkarvonen/checkpoints_cls_only_adding_Llama-3_3-70B-Instruct",
-                # None,
+                "adamkarvonen/checkpoints_act_cls_latentqa_pretrain_mix_adding_Llama-3_3-70B-Instruct",
+                "adamkarvonen/checkpoints_latentqa_only_adding_Llama-3_3-70B-Instruct",
+                "adamkarvonen/checkpoints_cls_only_adding_Llama-3_3-70B-Instruct",
+                None,
             ]
             target_lora_path_template = "{lora_path}"
             segment_start = -20
@@ -100,19 +89,7 @@ if __name__ == "__main__":
                 load_in_8bit=True,
                 bnb_8bit_compute_dtype=torch.bfloat16,
             )
-            model_kwargs = {"quantization_config": bnb_config, "attn_implementation": "sdpa"}
-
-        elif model_name in ("Qwen/Qwen3-4B", "Qwen/Qwen3-1.7B", "Qwen/Qwen3.5-4B"):
-            rows = secret_targets_personaqa(model_name)
-            if not rows:
-                raise ValueError(
-                    f"No personaqa target LoRAs on Hugging Face for {model_name} "
-                    "(paper uses adamkarvonen/Qwen3-8B-personaqa_shuffled_3_epochs and gemma/llama variants)."
-                )
-            target_lora_suffixes = [r["lora_hf_or_local"] for r in rows]
-            verbalizer_lora_paths = [None]
-            target_lora_path_template = "{lora_path}"
-            segment_start = -20
+            model_kwargs = {"quantization_config": bnb_config}
 
         else:
             raise ValueError(f"Unsupported MODEL_NAME: {model_name}")
@@ -130,7 +107,7 @@ if __name__ == "__main__":
         config = base_experiment.VerbalizerEvalConfig(
             model_name=model_name,
             activation_input_types=["lora"],
-            eval_batch_size=8,  # Reduced from 512 to save memory
+            eval_batch_size=512,
             verbalizer_generation_kwargs=generation_kwargs,
             full_seq_repeats=1,
             segment_repeats=1,
@@ -201,14 +178,6 @@ if __name__ == "__main__":
         print(f"Loading model: {model_name} on {device} with dtype={dtype}")
         model = load_model(model_name, dtype, **model_kwargs)
         model.eval()
-        
-        # Enable memory efficient attention if available
-        if hasattr(model.config, 'use_cache'):
-            model.config.use_cache = False  # Disable cache to save memory
-        
-        # Clear cache after loading
-        torch.cuda.empty_cache()
-        print(f"GPU memory after model loading: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
 
         # Add dummy adapter so peft_config exists and we can use the consistent PeftModel API
         dummy_config = LoraConfig()
@@ -278,9 +247,6 @@ if __name__ == "__main__":
 
                 if sanitized_target_name is not None and sanitized_target_name in model.peft_config:
                     model.delete_adapter(sanitized_target_name)
-                
-                # Clear GPU memory between iterations
-                torch.cuda.empty_cache()
 
                 combo_pbar.update(1)
 
