@@ -24,11 +24,8 @@ import time
 
 import torch
 
-# steering_hooks.py must be importable: either on PYTHONPATH already
-# (e.g. installed via `pip install -e .` as in train.sbatch), or sitting
-# next to this script. We try both.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from steering_hooks import add_hook, get_hf_activation_steering_hook  # noqa: E402
+from nl_probes.utils.steering_hooks import add_hook, get_hf_activation_steering_hook  # noqa: E402
 
 
 def time_forward_passes(model, input_ids, attention_mask, n_iters: int, warmup: int) -> float:

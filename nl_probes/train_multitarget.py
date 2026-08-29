@@ -16,7 +16,7 @@ residual MLP projector with legacy linear-checkpoint compatibility.
 This script intentionally reuses train_model() so optimizer, DDP, checkpoint,
 LoRA, evaluation, and signal-handling behavior stay aligned with the main SFT
 trainer. train_model() currently exposes the phase argument as
-``dual_target_phase_label``; it is target-count agnostic and is used here for
+``multi_target_phase_label``; it is target-count agnostic and is used here for
 all numbers of targets.
 """
 
@@ -51,8 +51,7 @@ from nl_probes.utils.hf_config import pretrained_hidden_size
 from nl_probes.utils.lora_utils import sanitize_lora_name
 
 
-# Keep this equal to the full per-target size used by the dual-target trainer.
-_DUAL_MAIN_TRAIN_SIZE = 6000
+_MULTI_MAIN_TRAIN_SIZE = 6000
 _MAIN_TEST_SIZE = 250
 _DEFAULT_TARGET_C = "Qwen/Qwen2.5-4B-Instruct"
 _DEFAULT_N_CHUNKS = 16
@@ -60,15 +59,8 @@ _STATE_FILENAME = "MULTITARGET_STATE.json"
 _STATE_SCHEMA_VERSION = 1
 _STEPS_PER_HALF_LEGACY = 30_000
 
-
-# The default keeps the total classification-data budget equal to the dual-target
-# run: N targets x (2/N * 6000) examples/target = 2 x 6000 examples. Use
-# --classification_total_target_equivalent 0 to disable this scaling.
-def _classification_datasets(num_targets: int, total_target_equivalent: float) -> dict[str, dict[str, Any]]:
-    if total_target_equivalent > 0:
-        per_target_train_size = round(_DUAL_MAIN_TRAIN_SIZE * total_target_equivalent / num_targets)
-    else:
-        per_target_train_size = _DUAL_MAIN_TRAIN_SIZE
+def _classification_datasets(num_targets: int) -> dict[str, dict[str, Any]]:
+    per_target_train_size = round(_MULTI_MAIN_TRAIN_SIZE * 2 / num_targets)
 
     return {
         "geometry_of_truth": {"num_train": per_target_train_size, "num_test": _MAIN_TEST_SIZE, "splits": ["train", "test"]},
@@ -112,20 +104,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_steps", type=int, default=10_000)
     parser.add_argument("--save_steps", type=int, default=10_000)
     parser.add_argument("--layer_percents", type=int, nargs="+", default=[25, 50, 75])
+    parser.add_argument("--mixture_profile", choices=["legacy", "diverse_fixed", "context_heavy_fixed"], default=None)
+    parser.add_argument("--mixture_seed", type=int, default=None)
+    parser.add_argument("--mixture_total_samples", type=int, default=None)
     parser.add_argument(
         "--n_chunks",
         type=int,
         default=_DEFAULT_N_CHUNKS,
         help="Number of contiguous chunks per target. 1 means sequential target training.",
-    )
-    parser.add_argument(
-        "--classification_total_target_equivalent",
-        type=float,
-        default=2.0,
-        help=(
-            "Total-target equivalent used to scale classification num_train per target. "
-            "Default 2.0 matches the dual-target total. Set 0 to use 6000 per target."
-        ),
     )
     return parser.parse_args()
 
@@ -447,7 +433,7 @@ def _run_phase(
             "multi_target_phase_complete": True,
             "multi_target_phase_label": phase_label,
         },
-        dual_target_phase_label=phase_label,
+        multi_target_phase_label=phase_label,
     )
 
     meta = read_latest_checkpoint_meta(cfg.save_dir)
@@ -469,6 +455,13 @@ def _run_phase(
 
 def main() -> None:
     args = _parse_args()
+    if args.mixture_profile is not None:
+        os.environ["AO_MIXTURE_PROFILE"] = args.mixture_profile
+    if args.mixture_seed is not None:
+        os.environ["AO_MIXTURE_SEED"] = str(args.mixture_seed)
+    if args.mixture_total_samples is not None:
+        os.environ["AO_MIXTURE_TOTAL_SAMPLES"] = str(args.mixture_total_samples)
+
     target_models = list(args.target_models)
     if not target_models:
         raise ValueError("At least one --target_model is required")
@@ -512,7 +505,6 @@ def main() -> None:
     tokenizer = load_tokenizer(args.oracle_model_name)
     classification_datasets = _classification_datasets(
         len(target_models),
-        args.classification_total_target_equivalent,
     )
 
     def loop_for(target_model_name: str) -> list:
@@ -525,7 +517,12 @@ def main() -> None:
             classification_datasets=classification_datasets,
             model_kwargs=model_kwargs,
         )
-        return loader_groups["latentqa_loaders"] + loader_groups["classification_loaders"] + loader_groups["past_lens_loaders"]
+        return (
+            loader_groups["latentqa_loaders"]
+            + loader_groups["cot_oracle_loaders"]
+            + loader_groups["classification_loaders"]
+            + loader_groups["past_lens_loaders"]
+        )
 
     loaders_by_target = [loop_for(target) for target in target_models]
     save_dir = namespaced_save_dir(wandb_suffix=args.wandb_suffix)

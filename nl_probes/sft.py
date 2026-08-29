@@ -36,6 +36,17 @@ from nl_probes.dataset_classes.classification import (
     ClassificationDatasetLoader,
 )
 from nl_probes.dataset_classes.latentqa_dataset import LatentQADatasetConfig, LatentQADatasetLoader
+try:
+    from nl_probes.dataset_classes.cot_dataset import CotOracleDatasetConfig, CotOracleDatasetLoader
+except ImportError:
+    CotOracleDatasetConfig = None
+    CotOracleDatasetLoader = None
+from nl_probes.utils.mixture import (
+    apply_training_mixture,
+    mixture_seed,
+    select_training_mixture,
+    write_mixture_manifest,
+)
 from nl_probes.dataset_classes.past_lens_dataset import PastLensDatasetConfig, PastLensDatasetLoader
 from nl_probes.dataset_classes.sae_training_data import (
     SAEActivatingSequencesDatasetConfig,
@@ -481,7 +492,7 @@ def train_model(
     verbose: bool = False,
     save_checkpoint_on_complete: bool = False,
     checkpoint_complete_extra: dict[str, Any] | None = None,
-    dual_target_phase_label: str | None = None,
+    multi_target_phase_label: str | None = None,
 ):
     """
     Training loop with:
@@ -494,7 +505,7 @@ def train_model(
     call's training slice finishes, so the next phase resumes from the phase boundary rather than
     the last periodic ``save_steps`` checkpoint mid-slice.
 
-    ``dual_target_phase_label`` (dual-target only): cumulative ``global_step`` continues across
+    ``multi_target_phase_label`` (dual-target only): cumulative ``global_step`` continues across
     phases, but batch skipping uses per-phase progress (see checkpoint ``extra``). Without this,
     ``global_step // steps_per_epoch`` can skip the entire training loop when resuming a completed
   phase slice.
@@ -666,14 +677,14 @@ def train_model(
         start_epoch = ckpt_epoch
         if rank == 0:
             print(f"Resuming from checkpoint: global_step={global_step}, epoch={start_epoch}")
-    if dual_target_phase_label:
+    if multi_target_phase_label:
         start_epoch = 0
         phase_slice_complete = False
         if ckpt_global_step is not None:
-            ckpt_phase = ckpt_extra.get("dual_target_phase")
-            ckpt_phase_start = int(ckpt_extra.get("dual_target_phase_start_global_step", 0))
-            phase_complete_flag = bool(ckpt_extra.get("dual_target_phase_complete", False))
-            if ckpt_phase == dual_target_phase_label:
+            ckpt_phase = ckpt_extra.get("multi_target_phase")
+            ckpt_phase_start = int(ckpt_extra.get("multi_target_phase_start_global_step", 0))
+            phase_complete_flag = bool(ckpt_extra.get("multi_target_phase_complete", False))
+            if ckpt_phase == multi_target_phase_label:
                 phase_start_global_step = ckpt_phase_start
                 updates_done_in_epoch = global_step - phase_start_global_step
                 phase_slice_complete = phase_complete_flag or updates_done_in_epoch >= steps_per_epoch
@@ -692,7 +703,7 @@ def train_model(
             updates_done_in_epoch = 0
         if rank == 0:
             print(
-                f"Dual-target phase {dual_target_phase_label}: "
+                f"Dual-target phase {multi_target_phase_label}: "
                 f"phase_start_global_step={phase_start_global_step} "
                 f"updates_done_in_this_slice={updates_done_in_epoch} "
                 f"steps_per_epoch={steps_per_epoch} "
@@ -701,8 +712,8 @@ def train_model(
 
     def _dual_target_ckpt_extra() -> dict[str, Any]:
         out: dict[str, Any] = {
-            "dual_target_phase": dual_target_phase_label,
-            "dual_target_phase_start_global_step": phase_start_global_step,
+            "multi_target_phase": multi_target_phase_label,
+            "multi_target_phase_start_global_step": phase_start_global_step,
         }
         if checkpoint_complete_extra:
             out.update(checkpoint_complete_extra)
@@ -728,7 +739,7 @@ def train_model(
                     global_step,
                     start_epoch,
                     rng_state=rng,
-                    extra=_dual_target_ckpt_extra() if dual_target_phase_label else {"signal": signum},
+                    extra=_dual_target_ckpt_extra() if multi_target_phase_label else {"signal": signum},
                     tag="step",
                     module_states=(
                         {projector_key: activation_projector.state_dict()}
@@ -777,7 +788,7 @@ def train_model(
         print("=" * 50)
         """
 
-    if not dual_target_phase_label:
+    if not multi_target_phase_label:
         resumed_updates = global_step
         if resumed_updates > 0:
             start_epoch = resumed_updates // steps_per_epoch
@@ -810,7 +821,7 @@ def train_model(
                 )
             dist.barrier()
 
-        if not dual_target_phase_label:
+        if not multi_target_phase_label:
             updates_done_in_epoch = 0
             if epoch == start_epoch and global_step > 0:
                 updates_done_in_epoch = global_step % steps_per_epoch
@@ -899,7 +910,7 @@ def train_model(
                             global_step,
                             epoch,
                             rng_state=rng,
-                            extra=_dual_target_ckpt_extra() if dual_target_phase_label else None,
+                            extra=_dual_target_ckpt_extra() if multi_target_phase_label else None,
                             tag="step",
                             module_states=(
                                 {projector_key: activation_projector.state_dict()}
@@ -940,8 +951,8 @@ def train_model(
     if save_checkpoint_on_complete:
         if rank == 0:
             rng = capture_rng_state()
-            extra = _dual_target_ckpt_extra() if dual_target_phase_label else {"dual_target_phase_complete": True}
-            if not dual_target_phase_label and checkpoint_complete_extra:
+            extra = _dual_target_ckpt_extra() if multi_target_phase_label else {"multi_target_phase_complete": True}
+            if not multi_target_phase_label and checkpoint_complete_extra:
                 extra.update(checkpoint_complete_extra)
             ckpt_path = save_checkpoint(
                 cfg.save_dir,
@@ -1044,6 +1055,23 @@ def build_datasets(
         removed = before - len(all_training_data)
         print(f"Percentile trim: kept <= {threshold} tokens (p={p:.6f}). Removed {removed}/{before} examples.")
 
+    # Select after length trimming so the fixed-budget comparison is exact.
+    # The selector is controlled by AO_MIXTURE_PROFILE; legacy/all remain
+    # available for direct comparisons and debugging.
+    before_mixture = len(all_training_data)
+    profile = os.environ.get("AO_MIXTURE_PROFILE", "diverse_fixed")
+    selected_training_data, manifest = select_training_mixture(
+        all_training_data,
+        profile=profile,
+        seed=mixture_seed(cfg.seed),
+        total_examples=before_mixture,
+    )
+    all_training_data = selected_training_data
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        manifest_path = os.path.join(cfg.save_dir, f"mixture_manifest_{profile}.json")
+        manifest["pre_mixture_examples_after_trim"] = before_mixture
+        write_mixture_manifest(manifest, manifest_path)
+
     set_seed(cfg.seed)
     random.shuffle(all_training_data)
 
@@ -1137,6 +1165,23 @@ def build_loader_groups(
         dataset_config=mk_cfg(
             custom_params=LatentQADatasetConfig(),
             num_train=100_000,
+            num_test=0,
+            splits=["train"],
+            model_name=model_name,
+            prompt_model_name=prompt_model_name,
+            layer_percents=layer_percents,
+            save_acts=False,
+            batch_size=act_collection_batch_size,
+        )
+    )
+
+    if CotOracleDatasetLoader is None or CotOracleDatasetConfig is None:
+        raise ImportError("CoT oracle dataset module is required for the training mixture")
+
+    cot_oracle_loader = CotOracleDatasetLoader(
+        dataset_config=mk_cfg(
+            CotOracleDatasetConfig(),
+            num_train=num_datapoints,
             num_test=0,
             splits=["train"],
             model_name=model_name,
@@ -1270,6 +1315,7 @@ def build_loader_groups(
     return {
         "past_lens_loaders": [past_lens_single, past_lens_multi],
         "latentqa_loaders": [latent_qa_loader],
+        "cot_oracle_loaders": [cot_oracle_loader],
         "classification_loaders": classification_loaders,
         "sae_loaders": sae_loaders,
         "sae_explanation_loaders": sae_explanation_loaders,

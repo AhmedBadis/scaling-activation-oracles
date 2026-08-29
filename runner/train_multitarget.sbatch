@@ -7,13 +7,7 @@
 #SBATCH --output=logs/train-multitarget/%j.out
 #SBATCH --error=logs/train-multitarget/%j.err
 
-# Generalized Activation Oracle runner.
-# Repeat --target_model in the desired order. Example below trains:
-# target_a chunk 0, target_b chunk 0, target_c chunk 0, target_a chunk 1, ...
-# Set N_CHUNKS=1 for sequential target training.
-
 module load Python/3.11.3-GCCcore-12.3.0
-
 export CUDA_VISIBLE_DEVICES=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -21,14 +15,8 @@ cd "$HOME/activation_oracles"
 mkdir -p logs/train-multitarget
 source .venv/bin/activate
 
-# Prefer pre-exported credentials in the job environment. Do not commit secrets
-# into this runner.
-if [[ -n "${HF_TOKEN:-}" ]]; then
-  export HF_TOKEN
-fi
-if [[ -n "${WANDB_API_KEY:-}" ]]; then
-  export WANDB_API_KEY
-fi
+if [[ -n "${HF_TOKEN:-}" ]]; then export HF_TOKEN; fi
+if [[ -n "${WANDB_API_KEY:-}" ]]; then export WANDB_API_KEY; fi
 
 pip install -e . --no-deps
 
@@ -51,4 +39,8 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --wandb_suffix="_16_PT_MLP_o1.7t4T4t4i" \
   --train_batch_size=4 \
   --gradient_accumulation_steps=4 \
-  --n_chunks=16
+  --n_chunks=16 \
+  --layer_percents 25 50 75 \
+  --mixture_profile="${AO_MIXTURE_PROFILE:-diverse_fixed}" \
+  --mixture_seed="${AO_MIXTURE_SEED:-42}" \
+  --mixture_total_samples="${AO_MIXTURE_TOTAL_SAMPLES:-400000}"
