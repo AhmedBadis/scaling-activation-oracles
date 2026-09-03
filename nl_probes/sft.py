@@ -410,7 +410,7 @@ def train_model(
     target_width = activation_model.config.hidden_size
     oracle_width = model.config.hidden_size
     activation_projector: torch.nn.Module | None = None
-    if target_width != oracle_width:
+    if target_width != oracle_width or cfg.use_learned_activation_projection:
         activation_projector = torch.nn.Linear(
             target_width,
             oracle_width,
@@ -418,17 +418,23 @@ def train_model(
             device=device,
             dtype=dtype,
         )
+        with torch.no_grad():
+            torch.nn.init.eye_(activation_projector.weight)
+            if activation_projector.bias is not None:
+                torch.nn.init.zeros_(activation_projector.bias)
         if rank == 0:
-            print(
-                "Hidden-size mismatch detected between target activations and oracle residual stream. "
-                f"Auto-enabling learned projection: target={cfg.target_model_name} ({target_width}) -> "
-                f"oracle={cfg.oracle_model_name} ({oracle_width}), bias={cfg.activation_projection_bias}."
-            )
-    elif cfg.use_learned_activation_projection and rank == 0:
-        print(
-            "use_learned_activation_projection is set but hidden sizes already match "
-            f"({target_width}); projection is not needed and will not be used."
-        )
+            if target_width != oracle_width:
+                print(
+                    "Hidden-size mismatch detected between target activations and oracle residual stream. "
+                    f"Auto-enabling learned projection: target={cfg.target_model_name} ({target_width}) -> "
+                    f"oracle={cfg.oracle_model_name} ({oracle_width}), bias={cfg.activation_projection_bias}."
+                )
+            else:
+                print(
+                    "Learned activation projection explicitly enabled despite matching hidden sizes: "
+                    f"target={cfg.target_model_name} ({target_width}) -> "
+                    f"oracle={cfg.oracle_model_name} ({oracle_width}), bias={cfg.activation_projection_bias}."
+                )
 
     model.enable_input_require_grads()
 
@@ -1212,7 +1218,7 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 16
+    train_batch_size = 4
     gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
@@ -1233,7 +1239,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 4
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(

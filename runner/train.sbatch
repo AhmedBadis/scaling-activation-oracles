@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=A100medium
+#SBATCH --partition=A40medium
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
@@ -46,5 +46,5 @@ NUM_GPUS=1
 # adjust nl_probes/sft.py args as needed, e.g., --config config.yaml --batch-size 8
 torchrun --nproc_per_node=$NUM_GPUS nl_probes/sft.py \
   --output_dir outputs/train \
-  --per_device_train_batch_size 16 \
-  --gradient_accumulation_steps 1 \
+  --per_device_train_batch_size 4 \
+  --gradient_accumulation_steps 4 \
