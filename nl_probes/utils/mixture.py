@@ -357,6 +357,21 @@ def apply_training_mixture(
         print(f"AO mixture family shortfalls: {manifest['shortfall_by_family']}")
     return selected
 
+def mixture_seed(default: int = 42) -> int:
+    raw = os.environ.get("AO_MIXTURE_SEED")
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+def write_mixture_manifest(manifest: Mapping[str, Any], path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(dict(manifest), handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 __all__ = [
     "FAMILY_COT",

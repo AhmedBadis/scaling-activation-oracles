@@ -15,10 +15,14 @@ cd "$HOME/activation_oracles"
 mkdir -p logs/train-multitarget
 source .venv/bin/activate
 
-if [[ -n "${HF_TOKEN:-}" ]]; then export HF_TOKEN; fi
-if [[ -n "${WANDB_API_KEY:-}" ]]; then export WANDB_API_KEY; fi
+python -c "from huggingface_hub import login; login(token='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')"
 
+# Rebuild the package with our fixes
 pip install -e . --no-deps
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export WANDB_API_KEY="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"
 
 nvidia-smi -L
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -35,12 +39,11 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --oracle_model_name="Qwen/Qwen3-1.7B" \
   --target_model="Qwen/Qwen3-4B" \
   --target_model="Qwen/Qwen3.5-4B" \
-  --target_model="Qwen/Qwen3-4B-Instruct" \
-  --wandb_suffix="_16_PT_MLP_o1.7t4T4t4i" \
-  --train_batch_size=4 \
-  --gradient_accumulation_steps=4 \
+  --wandb_suffix="_16_PT_MLP_o1.7t4T4" \
+  --train_batch_size=8 \
+  --gradient_accumulation_steps=2 \
   --n_chunks=16 \
   --layer_percents 25 50 75 \
-  --mixture_profile="${AO_MIXTURE_PROFILE:-diverse_fixed}" \
+  --mixture_profile="${AO_MIXTURE_PROFILE:-legacy}" \
   --mixture_seed="${AO_MIXTURE_SEED:-42}" \
   --mixture_total_samples="${AO_MIXTURE_TOTAL_SAMPLES:-400000}"

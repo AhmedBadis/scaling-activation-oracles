@@ -471,8 +471,6 @@ def main() -> None:
         raise ValueError("--n_chunks must be >= 1")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient_accumulation_steps must be >= 1")
-    if args.classification_total_target_equivalent < 0:
-        raise ValueError("--classification_total_target_equivalent must be >= 0")
 
     hidden_sizes = {target: pretrained_hidden_size(target) for target in target_models}
     if os.environ.get("LOCAL_RANK", "0") == "0":
