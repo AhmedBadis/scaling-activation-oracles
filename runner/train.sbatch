@@ -19,7 +19,7 @@ source .venv/bin/activate
 # Set up HuggingFace token
 python -c "from huggingface_hub import login; login(token='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')"
 
-# Rebuild the package with our fixes
+# Rebuild the package
 pip install -e . --no-deps
 
 export CUDA_VISIBLE_DEVICES=0

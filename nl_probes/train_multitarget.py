@@ -26,6 +26,7 @@ import argparse
 import glob
 import json
 import os
+import zipfile
 from dataclasses import asdict
 from datetime import timedelta
 from typing import Any, List
@@ -44,11 +45,11 @@ from nl_probes.sft import (
     train_model,
 )
 from nl_probes.utils.activation_utils import get_hf_submodule
-from nl_probes.utils.checkpointing import read_latest_checkpoint_meta
 from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
 from nl_probes.utils.hf_config import pretrained_hidden_size
 from nl_probes.utils.lora_utils import sanitize_lora_name
+from nl_probes.utils.mixture import ORIGINAL_TOTAL_SAMPLES, ORIGINAL_WEIGHTS, normalise_weights
 
 
 _MULTI_MAIN_TRAIN_SIZE = 6000
@@ -94,19 +95,40 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_suffix", type=str, required=True)
     parser.add_argument("--hook_onto_layer", type=int, default=1)
     parser.add_argument("--train_batch_size", type=int, default=16)
+    parser.add_argument(
+        "--activation_collection_batch_size",
+        type=int,
+        default=None,
+        help="Global batch size for activation collection; defaults to the per-rank training batch size.",
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=None,
+        help="Global evaluation batch size; defaults to the existing config multiplier.",
+    )
+    parser.add_argument(
+        "--max_len_percentile",
+        type=float,
+        default=None,
+        help="Optional strict upper percentile for materialized training-example lengths.",
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument(
         "--gradient_checkpointing",
         action=argparse.BooleanOptionalAction,
-        default=None,
-        help="If omitted, use the config/default behavior.",
+        default=False,
+        help="Deprecated compatibility flag; this multi-target runner always disables gradient checkpointing.",
     )
     parser.add_argument("--eval_steps", type=int, default=10_000)
     parser.add_argument("--save_steps", type=int, default=10_000)
     parser.add_argument("--layer_percents", type=int, nargs="+", default=[25, 50, 75])
-    parser.add_argument("--mixture_profile", choices=["legacy", "diverse_fixed", "context_heavy_fixed"], default=None)
-    parser.add_argument("--mixture_seed", type=int, default=None)
-    parser.add_argument("--mixture_total_samples", type=int, default=None)
+    parser.add_argument("--cot_percent", type=float, default=0.0, help="Materialized CoT quota percentage.")
+    parser.add_argument("--context_percent", type=float, default=60.0, help="Materialized past/future context quota percentage.")
+    parser.add_argument("--classification_percent", type=float, default=33.6, help="Materialized classification quota percentage.")
+    parser.add_argument("--spqa_percent", type=float, default=6.4, help="Materialized SPQA/LatentQA quota percentage.")
+    parser.add_argument("--mixture_seed", type=int, default=42)
+    parser.add_argument("--mixture_total_samples", type=int, default=ORIGINAL_TOTAL_SAMPLES)
     parser.add_argument(
         "--n_chunks",
         type=int,
@@ -158,12 +180,89 @@ def _write_state(
         json.dump(payload, handle, indent=2)
 
 
-def _checkpoint_exists(save_dir: str) -> bool:
-    return bool(
+def _checkpoint_candidates(save_dir: str) -> list[str]:
+    paths = set(
         glob.glob(os.path.join(save_dir, "checkpoint_step_*.pth"))
-        or glob.glob(os.path.join(save_dir, "checkpoint_epoch_*.pth"))
-        or os.path.isdir(os.path.join(save_dir, "final"))
+        + glob.glob(os.path.join(save_dir, "checkpoint_epoch_*.pth"))
     )
+    return sorted(
+        paths,
+        key=lambda path: (_step_number(path), os.path.getmtime(path)),
+        reverse=True,
+    )
+
+
+def _checkpoint_is_readable(path: str) -> bool:
+    """Check the archive/container without loading model and optimizer tensors."""
+    try:
+        if os.path.getsize(path) < 128:
+            return False
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                return archive.testzip() is None
+        # Compatibility path for legacy non-zip torch checkpoints.
+        torch.load(path, map_location="cpu", weights_only=False)
+        return True
+    except Exception:
+        return False
+
+
+def _quarantine_corrupt_checkpoints(save_dir: str) -> list[str]:
+    """Move truncated checkpoints out of the loader's *.pth glob."""
+    quarantined: list[str] = []
+    for path in _checkpoint_candidates(save_dir):
+        if _checkpoint_is_readable(path):
+            continue
+        quarantine_path = path + ".corrupt"
+        suffix = 1
+        while os.path.exists(quarantine_path):
+            quarantine_path = f"{path}.corrupt.{suffix}"
+            suffix += 1
+        os.replace(path, quarantine_path)
+        quarantined.append(path)
+        print(f"Quarantined unreadable checkpoint: {path} -> {quarantine_path}", flush=True)
+    return quarantined
+
+
+def _valid_checkpoint_candidates(save_dir: str) -> list[str]:
+    return [path for path in _checkpoint_candidates(save_dir) if _checkpoint_is_readable(path)]
+
+
+def _read_latest_valid_checkpoint_meta(save_dir: str) -> dict[str, Any]:
+    """Load the newest readable checkpoint, skipping any bad archive."""
+    for path in _valid_checkpoint_candidates(save_dir):
+        try:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            if isinstance(checkpoint, dict):
+                return checkpoint
+        except Exception as exc:
+            quarantine_path = path + ".corrupt"
+            suffix = 1
+            while os.path.exists(quarantine_path):
+                quarantine_path = f"{path}.corrupt.{suffix}"
+                suffix += 1
+            os.replace(path, quarantine_path)
+            print(f"Skipped unreadable checkpoint {path}: {exc}", flush=True)
+    return {}
+
+
+def _checkpoint_exists(save_dir: str) -> bool:
+    return bool(_valid_checkpoint_candidates(save_dir) or os.path.isdir(os.path.join(save_dir, "final")))
+
+
+def _infer_resume_phase(save_dir: str, phase_labels: list[str]) -> int | None:
+    """Infer the current/next phase when a prior run crashed before writing state."""
+    checkpoint = _read_latest_valid_checkpoint_meta(save_dir)
+    if not checkpoint:
+        return None
+    extra = checkpoint.get("extra") or checkpoint.get("checkpoint_extra") or {}
+    label = extra.get("multi_target_phase_label") or extra.get("multi_target_phase")
+    if label not in phase_labels:
+        return None
+    index = phase_labels.index(label)
+    if bool(extra.get("multi_target_phase_complete", False)):
+        return index + 1
+    return index
 
 
 def _validate_or_initialize_resume(
@@ -175,12 +274,22 @@ def _validate_or_initialize_resume(
     phase_labels: list[str],
 ) -> int:
     """Strictly validate the schedule and return the next phase index."""
+    _quarantine_corrupt_checkpoints(save_dir)
     state = _read_state(save_dir)
     if not state:
+        inferred_phase = _infer_resume_phase(save_dir, phase_labels)
+        if inferred_phase is not None:
+            print(
+                f"No {_STATE_FILENAME} found; inferred resume phase "
+                f"{inferred_phase} from the latest valid checkpoint.",
+                flush=True,
+            )
+            return inferred_phase
         if _checkpoint_exists(save_dir):
-            raise RuntimeError(
-                f"Found checkpoints in {save_dir} but no {_STATE_FILENAME}. "
-                "Refusing an unvalidated resume; use a new wandb_suffix/save directory."
+            print(
+                f"No {_STATE_FILENAME} found and no phase label was recoverable; "
+                "resuming phase 0 from the valid checkpoint/final adapter.",
+                flush=True,
             )
         return 0
 
@@ -227,14 +336,13 @@ def _load_projector_for_eval(
     dtype: torch.dtype,
 ) -> torch.nn.Module:
     projector_key = activation_projector_key(target_model_name)
-    checkpoints = sorted(
-        glob.glob(os.path.join(save_dir, "checkpoint_step_*.pth")),
-        key=_step_number,
-        reverse=True,
-    )
     projector_state = None
-    for checkpoint_path in checkpoints:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    for checkpoint_path in _valid_checkpoint_candidates(save_dir):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        except Exception as exc:
+            print(f"Skipping unreadable projector checkpoint {checkpoint_path}: {exc}", flush=True)
+            continue
         module_states = checkpoint.get("module_states") or {}
         if projector_key in module_states:
             projector_state = module_states[projector_key]
@@ -349,6 +457,21 @@ def _eval_target(
     return scores
 
 
+def _estimate_phase_optimizer_steps(
+    phase_training_data: list,
+    *,
+    train_batch_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Mirror train_model's trimming/sharding arithmetic for metadata recovery."""
+    world_size = dist.get_world_size()
+    global_batch = train_batch_size * world_size
+    effective_examples = (len(phase_training_data) // global_batch) * global_batch
+    per_rank_examples = effective_examples // world_size
+    batches = per_rank_examples // train_batch_size
+    return batches // gradient_accumulation_steps
+
+
 def _run_phase(
     *,
     cfg: SelfInterpTrainingConfig,
@@ -366,6 +489,9 @@ def _run_phase(
     model_kwargs: dict[str, Any],
     local_rank: int,
     train_batch_size: int,
+    activation_collection_batch_size: int | None,
+    eval_batch_size: int | None,
+    max_len_percentile: float | None,
     hook_onto_layer: int,
     gradient_accumulation_steps: int,
     gradient_checkpointing: bool | None,
@@ -381,14 +507,31 @@ def _run_phase(
     cfg.hf_repo_name = "N/A"
     cfg.layer_percents = layer_percents
     cfg.train_batch_size = train_batch_size
-    cfg.activation_collection_batch_size = train_batch_size * 4
-    cfg.eval_batch_size = train_batch_size * 8
+    cfg.activation_collection_batch_size = (
+        activation_collection_batch_size
+        if activation_collection_batch_size is not None
+        else train_batch_size * 4
+    )
+    cfg.eval_batch_size = (
+        eval_batch_size if eval_batch_size is not None else train_batch_size * 8
+    )
     cfg.eval_steps = eval_steps
     cfg.eval_on_start = True
-    cfg.gradient_checkpointing = gradient_checkpointing
+    if gradient_checkpointing and local_rank == 0:
+        print(
+            f"[{phase_label}] Ignoring requested gradient checkpointing: "
+            "this runner hard-disables it because the current model raises "
+            "CheckpointError during recomputation."
+        )
+    cfg.gradient_checkpointing = False
     cfg.gradient_accumulation_steps = gradient_accumulation_steps
     cfg.save_steps = save_steps
     cfg.finalize(dataset_loaders=loop_dataset_loaders)
+    # CLI values are authoritative. Reapply them after finalize() in case the
+    # config class populates or normalizes training defaults.
+    cfg.train_batch_size = train_batch_size
+    cfg.gradient_accumulation_steps = gradient_accumulation_steps
+    cfg.gradient_checkpointing = False
 
     if cfg.wandb_run_name:
         cfg.wandb_run_name = f"{cfg.wandb_run_name}_{phase_label}"
@@ -397,7 +540,9 @@ def _run_phase(
         print(
             f"[{phase_label}] target_index={target_models.index(target_model_name)} "
             f"target={target_model_name} chunk={chunk_index}/{n_chunks} "
-            f"save_dir={cfg.save_dir} load_lora={load_lora_path}"
+            f"save_dir={cfg.save_dir} load_lora={load_lora_path} "
+            f"train_batch_size={cfg.train_batch_size} "
+            f"gradient_accumulation_steps={cfg.gradient_accumulation_steps}"
         )
         _ensure_datasets_exist(loop_dataset_loaders)
     dist.barrier()
@@ -405,6 +550,7 @@ def _run_phase(
     all_training_data, all_eval_data = build_datasets(
         cfg,
         dataset_loaders=loop_dataset_loaders,
+        max_len_percentile=max_len_percentile,
         window_mult=cfg.window_mult,
     )
     chunk_size = len(all_training_data) // n_chunks
@@ -419,7 +565,14 @@ def _run_phase(
         )
         print(asdict(cfg))
 
-    train_model(
+    _quarantine_corrupt_checkpoints(cfg.save_dir)
+
+    if cfg.gradient_checkpointing is not False:
+        raise RuntimeError("Internal error: gradient checkpointing must be False")
+    if local_rank == 0:
+        print(f"[{phase_label}] gradient_checkpointing=False (hard-disabled)", flush=True)
+
+    train_kwargs = dict(
         cfg=cfg,
         training_data=phase_training_data,
         eval_datasets=all_eval_data,
@@ -436,8 +589,27 @@ def _run_phase(
         multi_target_phase_label=phase_label,
     )
 
-    meta = read_latest_checkpoint_meta(cfg.save_dir)
-    global_step = int(meta.get("global_step", 0))
+    train_model(**train_kwargs)
+
+    _quarantine_corrupt_checkpoints(cfg.save_dir)
+    meta = _read_latest_valid_checkpoint_meta(cfg.save_dir)
+    phase_steps = _estimate_phase_optimizer_steps(
+        phase_training_data,
+        train_batch_size=cfg.train_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+    )
+    extra = meta.get("extra") or meta.get("checkpoint_extra") or {}
+    if meta:
+        phase_start = int(extra.get("multi_target_phase_start_global_step", meta.get("global_step", 0)))
+        global_step = phase_start + phase_steps
+    else:
+        prior_state = _read_state(cfg.save_dir)
+        global_step = int(prior_state.get("global_step", 0)) + phase_steps
+        print(
+            f"No readable checkpoint metadata remained after phase {phase_label}; "
+            f"using estimated global_step={global_step}.",
+            flush=True,
+        )
     if local_rank == 0:
         _write_state(
             cfg.save_dir,
@@ -455,12 +627,18 @@ def _run_phase(
 
 def main() -> None:
     args = _parse_args()
-    if args.mixture_profile is not None:
-        os.environ["AO_MIXTURE_PROFILE"] = args.mixture_profile
-    if args.mixture_seed is not None:
-        os.environ["AO_MIXTURE_SEED"] = str(args.mixture_seed)
-    if args.mixture_total_samples is not None:
-        os.environ["AO_MIXTURE_TOTAL_SAMPLES"] = str(args.mixture_total_samples)
+    mixture_weights = {
+        "cot_oracle": args.cot_percent,
+        "past_lens": args.context_percent,
+        "classification": args.classification_percent,
+        "legacy_latentqa": args.spqa_percent,
+    }
+    normalise_weights(mixture_weights)
+    os.environ["AO_MIXTURE_WEIGHTS"] = json.dumps(mixture_weights, sort_keys=True)
+    os.environ["AO_MIXTURE_SEED"] = str(args.mixture_seed)
+    os.environ["AO_MIXTURE_TOTAL_SAMPLES"] = str(args.mixture_total_samples)
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        print(f"Materialized mixture: total={args.mixture_total_samples} weights={mixture_weights}")
 
     target_models = list(args.target_models)
     if not target_models:
@@ -471,6 +649,14 @@ def main() -> None:
         raise ValueError("--n_chunks must be >= 1")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient_accumulation_steps must be >= 1")
+    if args.train_batch_size < 1:
+        raise ValueError("--train_batch_size must be >= 1")
+    if args.activation_collection_batch_size is not None and args.activation_collection_batch_size < 1:
+        raise ValueError("--activation_collection_batch_size must be >= 1")
+    if args.eval_batch_size is not None and args.eval_batch_size < 1:
+        raise ValueError("--eval_batch_size must be >= 1")
+    if args.max_len_percentile is not None and not 0.0 < args.max_len_percentile < 1.0:
+        raise ValueError("--max_len_percentile must be strictly between 0 and 1")
 
     hidden_sizes = {target: pretrained_hidden_size(target) for target in target_models}
     if os.environ.get("LOCAL_RANK", "0") == "0":
@@ -491,6 +677,26 @@ def main() -> None:
         )
     train_batch_size = args.train_batch_size // world_size
 
+    if args.activation_collection_batch_size is not None:
+        if args.activation_collection_batch_size % world_size != 0:
+            raise ValueError(
+                f"Global activation collection batch size {args.activation_collection_batch_size} "
+                f"must be divisible by world size {world_size}"
+            )
+        activation_collection_batch_size = args.activation_collection_batch_size // world_size
+    else:
+        activation_collection_batch_size = None
+
+    if args.eval_batch_size is not None:
+        if args.eval_batch_size % world_size != 0:
+            raise ValueError(
+                f"Global evaluation batch size {args.eval_batch_size} "
+                f"must be divisible by world size {world_size}"
+            )
+        eval_batch_size = args.eval_batch_size // world_size
+    else:
+        eval_batch_size = None
+
     large_model_names = {
         "Qwen/Qwen3-32B",
         "meta-llama/Llama-3.3-70B-Instruct",
@@ -510,7 +716,11 @@ def main() -> None:
             model_name=target_model_name,
             prompt_model_name=args.oracle_model_name,
             layer_percents=args.layer_percents,
-            act_collection_batch_size=train_batch_size,
+            act_collection_batch_size=(
+                activation_collection_batch_size
+                if activation_collection_batch_size is not None
+                else train_batch_size
+            ),
             save_acts=False,
             classification_datasets=classification_datasets,
             model_kwargs=model_kwargs,
@@ -590,9 +800,12 @@ def main() -> None:
             model_kwargs=model_kwargs,
             local_rank=local_rank,
             train_batch_size=train_batch_size,
+            activation_collection_batch_size=activation_collection_batch_size,
+            eval_batch_size=eval_batch_size,
+            max_len_percentile=args.max_len_percentile,
             hook_onto_layer=args.hook_onto_layer,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            gradient_checkpointing=args.gradient_checkpointing,
+            gradient_checkpointing=False,
             eval_steps=args.eval_steps,
             save_steps=args.save_steps,
             layer_percents=args.layer_percents,
@@ -609,7 +822,9 @@ def main() -> None:
             target_model_name=target_model_name,
             wandb_suffix=args.wandb_suffix,
         )
-        eval_cfg.eval_batch_size = (train_batch_size * world_size) * 8
+        eval_cfg.eval_batch_size = (
+            eval_batch_size if eval_batch_size is not None else train_batch_size * 8
+        )
         eval_cfg.hook_onto_layer = args.hook_onto_layer
         eval_cfg.layer_percents = args.layer_percents
         eval_cfg.finalize(dataset_loaders=loaders)

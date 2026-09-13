@@ -23,6 +23,8 @@ python -c "from huggingface_hub import login; login(token='hf_muAcYhjlrtDKtXpdSg
 pip install -e . --no-deps
 
 export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export WANDB_API_KEY="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"
 
 # diagnostics
 echo "== env =="

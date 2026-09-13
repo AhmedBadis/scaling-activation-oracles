@@ -425,33 +425,46 @@ def oom_preflight_check(
     dtype: torch.dtype,
     projection_module: torch.nn.Module | None = None,
 ) -> None:
+    """Run a bounded memory probe without multiplying the worst-case sequence.
+
+    The previous implementation repeated the longest example ``cfg.train_batch_size``
+    times and also allocated a temporary AdamW optimizer. On a 44 GB A40 this could
+    OOM before the real training loop, even when the configured microbatch was safe.
+    The actual launcher uses a microbatch of one, so one longest-example backward
+    pass is the relevant preflight and avoids a second optimizer-state allocation.
+    """
+    if not training_data:
+        raise ValueError("Cannot run OOM preflight with an empty training dataset")
+
     longest_prompt = max(training_data, key=lambda x: len(x.input_ids))
-    long_prompts = [longest_prompt] * cfg.train_batch_size
-    long_prompts = materialize_missing_steering_vectors(long_prompts, activation_tokenizer, activation_model)
-    largest_possible_batch = construct_batch(long_prompts, tokenizer, device)
+    preflight_points = materialize_missing_steering_vectors(
+        [longest_prompt], activation_tokenizer, activation_model
+    )
+    preflight_batch = construct_batch(preflight_points, tokenizer, device)
 
-    dummy_optimizer_params = list(model.parameters())
+    model.zero_grad(set_to_none=True)
     if projection_module is not None:
-        dummy_optimizer_params.extend(projection_module.parameters())
-    dummy_optimizer = torch.optim.AdamW(dummy_optimizer_params, lr=0.0)
+        projection_module.zero_grad(set_to_none=True)
 
-    for _ in tqdm(range(3), desc="OOM preflight check"):
-        loss = train_features_batch(
-            cfg,
-            largest_possible_batch,
-            model,
-            submodule,
-            device,
-            dtype,
-            projection_module=projection_module,
-        )
-        loss.backward()
-        dummy_optimizer.step()
-        dummy_optimizer.zero_grad()
-
-    del dummy_optimizer
-    torch.cuda.empty_cache()
-    gc.collect()
+    try:
+        for _ in tqdm(range(1), desc="OOM preflight check"):
+            loss = train_features_batch(
+                cfg,
+                preflight_batch,
+                model,
+                submodule,
+                device,
+                dtype,
+                projection_module=projection_module,
+            )
+            loss.backward()
+    finally:
+        model.zero_grad(set_to_none=True)
+        if projection_module is not None:
+            projection_module.zero_grad(set_to_none=True)
+        del preflight_batch, preflight_points
+        torch.cuda.empty_cache()
+        gc.collect()
 
     print("OOM preflight check complete")
 
@@ -881,7 +894,7 @@ def train_model(
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
-                if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
+                if getattr(cfg, "eval_steps", None) and cfg.eval_steps > 0 and global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         eval_all_datasets(
                             cfg,
@@ -899,7 +912,7 @@ def train_model(
                     dist.barrier()
 
                 # Checkpoint on update steps
-                if getattr(cfg, "save_steps", None) and (global_step % cfg.save_steps == 0) and global_step > 0:
+                if getattr(cfg, "save_steps", None) and cfg.save_steps > 0 and (global_step % cfg.save_steps == 0) and global_step > 0:
                     if rank == 0:
                         rng = capture_rng_state()
                         ckpt_path = save_checkpoint(
@@ -1016,7 +1029,7 @@ def train_model(
 def build_datasets(
     cfg: SelfInterpTrainingConfig,
     dataset_loaders: list[ActDatasetLoader],
-    max_len_percentile: float | None = 0.999,
+    max_len_percentile: float | None = None,
     window_mult: int | None = 20,
 ) -> tuple[list[TrainingDataPoint], dict[str, list[TrainingDataPoint]]]:
     set_seed(cfg.seed)
@@ -1055,20 +1068,20 @@ def build_datasets(
         removed = before - len(all_training_data)
         print(f"Percentile trim: kept <= {threshold} tokens (p={p:.6f}). Removed {removed}/{before} examples.")
 
-    # Select after length trimming so the fixed-budget comparison is exact.
-    # The selector is controlled by AO_MIXTURE_PROFILE; legacy/all remain
-    # available for direct comparisons and debugging.
+    # Select after length trimming. Counts are enforced on materialized examples.
+    # The default is the paper's exact one-million-example distribution; CoT is
+    # an optional fourth family supplied through AO_MIXTURE_WEIGHTS and
+    # reallocates this fixed budget rather than increasing it.
     before_mixture = len(all_training_data)
-    profile = os.environ.get("AO_MIXTURE_PROFILE", "diverse_fixed")
+    configured_total = int(os.environ.get("AO_MIXTURE_TOTAL_SAMPLES", "1000000"))
     selected_training_data, manifest = select_training_mixture(
         all_training_data,
-        profile=profile,
         seed=mixture_seed(cfg.seed),
-        total_examples=before_mixture,
+        total_examples=configured_total,
     )
     all_training_data = selected_training_data
     if os.environ.get("LOCAL_RANK", "0") == "0":
-        manifest_path = os.path.join(cfg.save_dir, f"mixture_manifest_{profile}.json")
+        manifest_path = os.path.join(cfg.save_dir, "mixture_manifest.json")
         manifest["pre_mixture_examples_after_trim"] = before_mixture
         write_mixture_manifest(manifest, manifest_path)
 
@@ -1118,13 +1131,37 @@ def build_loader_groups(
     model_kwargs: dict[str, Any],
 ) -> dict[str, list[ActDatasetLoader]]:
     DEBUG = False
+    # Candidate pools are sized to the paper-scale materialized dataset.
+    # Each PastLens loader emits one datapoint per requested layer, so
+    # 100,000 source examples x 2 loaders x 3 layers = 600,000 context
+    # candidates, enough for the default 570,000 quota.
     num_datapoints = 100_000
+    latentqa_num_datapoints = 80_000
+    cot_num_datapoints = 60_000
+    # Mixture selection happens after materialization.  Provision enough CoT
+    # candidates for the requested quota instead of failing at selection time.
+    # The launcher stores percentages (for example 25), while mixture.py also
+    # accepts normalized weights (for example 0.25), so handle both forms.
+    try:
+        mixture_total = int(os.environ.get("AO_MIXTURE_TOTAL_SAMPLES", "1000000"))
+        raw_weights = json.loads(os.environ.get("AO_MIXTURE_WEIGHTS", "{}"))
+        raw_cot = float(raw_weights.get("cot_oracle", 0.0))
+        raw_total = sum(float(value) for value in raw_weights.values())
+        cot_weight = raw_cot / 100.0 if abs(raw_total - 100.0) < 1e-6 else raw_cot
+        requested_cot = math.ceil(mixture_total * cot_weight)
+        cot_num_datapoints = max(cot_num_datapoints, requested_cot)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # Keep the historical pool size when this helper is called without the
+        # launcher's mixture environment variables.
+        pass
 
     # DEBUG = True
 
     if DEBUG:
         print("DEBUG mode: using small datasets")
-        num_datapoints = 100
+        num_datapoints = 1_000
+        latentqa_num_datapoints = 200
+        cot_num_datapoints = 200
 
     # PastLens: build both single-token and multi-token variants
     past_lens_single = PastLensDatasetLoader(
@@ -1164,7 +1201,7 @@ def build_loader_groups(
     latent_qa_loader = LatentQADatasetLoader(
         dataset_config=mk_cfg(
             custom_params=LatentQADatasetConfig(),
-            num_train=100_000,
+            num_train=latentqa_num_datapoints,
             num_test=0,
             splits=["train"],
             model_name=model_name,
@@ -1181,7 +1218,7 @@ def build_loader_groups(
     cot_oracle_loader = CotOracleDatasetLoader(
         dataset_config=mk_cfg(
             CotOracleDatasetConfig(),
-            num_train=num_datapoints,
+            num_train=cot_num_datapoints,
             num_test=0,
             splits=["train"],
             model_name=model_name,
@@ -1447,7 +1484,7 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 16
+    train_batch_size = 2
     gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
@@ -1468,7 +1505,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 8
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(
@@ -1486,13 +1523,14 @@ if __name__ == "__main__":
     sae_dataset_loaders = loader_groups["sae_loaders"]
     sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
     latentqa_loaders = loader_groups["latentqa_loaders"]
+    cot_oracle_loaders = loader_groups["cot_oracle_loaders"]
 
     iterations = [
         # Default dataset mixture
         # Set load_lora_path to checkpoint path to continue training
         {
             "load_lora_path": None,
-            "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
+            "dataset_loaders": latentqa_loaders + cot_oracle_loaders + classification_dataset_loaders + past_lens_loaders,
             "wandb_suffix": f"_latentqa_cls_past_lens_oracle_{cfg.oracle_model_name.split('/')[-1]}_target_{cfg.target_model_name.split('/')[-1]}",
         },
         # {

@@ -17,11 +17,9 @@ source .venv/bin/activate
 
 python -c "from huggingface_hub import login; login(token='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')"
 
-# Rebuild the package with our fixes
+# Rebuild the package
 pip install -e . --no-deps
 
-export CUDA_VISIBLE_DEVICES=0
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_API_KEY="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"
 
 nvidia-smi -L
@@ -40,10 +38,16 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --target_model="Qwen/Qwen3-4B" \
   --target_model="Qwen/Qwen3.5-4B" \
   --wandb_suffix="_16_PT_MLP_o1.7t4T4" \
-  --train_batch_size=8 \
-  --gradient_accumulation_steps=2 \
+  --train_batch_size=2 \
+  --gradient_accumulation_steps=8 \
+  --no-gradient_checkpointing \
+  --eval_steps=0 \
+  --save_steps=0 \
   --n_chunks=16 \
   --layer_percents 25 50 75 \
-  --mixture_profile="${AO_MIXTURE_PROFILE:-legacy}" \
-  --mixture_seed="${AO_MIXTURE_SEED:-42}" \
-  --mixture_total_samples="${AO_MIXTURE_TOTAL_SAMPLES:-400000}"
+  --cot_percent=25 \
+  --context_percent=47 \
+  --classification_percent=24 \
+  --spqa_percent=4 \
+  --mixture_seed=42 \
+  --mixture_total_samples=1000000
