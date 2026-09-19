@@ -194,3 +194,5 @@ openai_api_key.txt
 run_demo_gpu.sbatch
 logs/
 .venv_old/
+.deprecated/
+experiments/ood_target_adapters
