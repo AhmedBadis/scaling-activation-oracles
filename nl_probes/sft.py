@@ -44,6 +44,8 @@ except ImportError:
 from nl_probes.utils.mixture import (
     apply_training_mixture,
     mixture_seed,
+    mixture_total_samples,
+    mixture_weights,
     select_training_mixture,
     write_mixture_manifest,
 )
@@ -68,7 +70,9 @@ from nl_probes.utils.dataset_utils import (
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses, parse_answer
 from nl_probes.utils.checkpointing import (
+    atomic_save,
     capture_rng_state,
+    find_latest_checkpoint,
     load_checkpoint_if_exists,
     save_checkpoint,
 )
@@ -157,6 +161,105 @@ def make_activation_projector(
         device=device,
         dtype=dtype,
     )
+
+
+FINAL_PROJECTOR_BUNDLE_NAME = "activation_projectors.pth"
+
+
+def _load_torch_cpu(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _cpu_state_dict(state_dict: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in state_dict.items()
+    }
+
+
+def _projector_states_from_latest_checkpoint(save_dir: str) -> dict[str, dict[str, Any]]:
+    """Get previously saved per-target projectors only for final export."""
+    checkpoint_path = find_latest_checkpoint(save_dir)
+    if checkpoint_path is None:
+        return {}
+    checkpoint = _load_torch_cpu(Path(checkpoint_path))
+    if not isinstance(checkpoint, dict):
+        return {}
+    module_states = checkpoint.get("module_states")
+    if not isinstance(module_states, dict):
+        return {}
+    return {
+        key: _cpu_state_dict(state)
+        for key, state in module_states.items()
+        if isinstance(key, str)
+        and key.startswith("activation_projector__")
+        and isinstance(state, dict)
+    }
+
+
+def save_final_projectors(
+    save_dir: str,
+    target_model_name: str,
+    activation_projector: torch.nn.Module | None,
+) -> Path | None:
+    """Save final projector state(s) under ``final/``.
+
+    The current in-memory projector is authoritative. Existing final entries
+    are preserved so phased multi-target runs keep projectors from earlier
+    targets, while checkpoint states fill any missing entries.
+    """
+    final_dir = Path(save_dir) / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = final_dir / FINAL_PROJECTOR_BUNDLE_NAME
+    projectors: dict[str, dict[str, Any]] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+
+    if bundle_path.is_file():
+        try:
+            previous = _load_torch_cpu(bundle_path)
+            if isinstance(previous, dict):
+                previous_projectors = previous.get("projectors", {})
+                if isinstance(previous_projectors, dict):
+                    projectors.update({
+                        key: _cpu_state_dict(state)
+                        for key, state in previous_projectors.items()
+                        if isinstance(key, str) and isinstance(state, dict)
+                    })
+                previous_metadata = previous.get("metadata", {})
+                if isinstance(previous_metadata, dict):
+                    metadata.update(previous_metadata)
+        except Exception as exc:
+            print(f"Warning: could not read existing final projector bundle: {exc}")
+
+    # Fill missing target entries from the cumulative checkpoint state, but do
+    # not overwrite an already-exported final state with an intermediate one.
+    for key, state in _projector_states_from_latest_checkpoint(save_dir).items():
+        projectors.setdefault(key, state)
+
+    if activation_projector is not None:
+        current_key = activation_projector_key(target_model_name)
+        projectors[current_key] = _cpu_state_dict(activation_projector.state_dict())
+        metadata[current_key] = {
+            "target_model_name": target_model_name,
+            "input_dim": int(activation_projector.base.in_features),
+            "output_dim": int(activation_projector.base.out_features),
+        }
+
+    if not projectors:
+        return None
+
+    atomic_save(
+        {
+            "format_version": 1,
+            "projectors": projectors,
+            "metadata": metadata,
+        },
+        str(bundle_path),
+    )
+    return bundle_path
 
 
 def _sync_module_grads(module: torch.nn.Module | None, world_size: int) -> None:
@@ -493,6 +596,21 @@ def length_grouped_reorder(
     return [data[i] for i in new_order]
 
 
+def _optimizer_parameter_names(
+    train_model_module: torch.nn.Module,
+    activation_projector: torch.nn.Module | None,
+    projector_key: str,
+) -> list[list[str]]:
+    """Return stable names in exactly the order used to build the optimizer."""
+    names = [name for name, _ in train_model_module.named_parameters()]
+    if activation_projector is not None:
+        names.extend(
+            f"{projector_key}.{name}"
+            for name, _ in activation_projector.named_parameters()
+        )
+    return [names]
+
+
 # -------------------- train_model with checkpointing --------------------
 def train_model(
     cfg: "SelfInterpTrainingConfig",
@@ -545,7 +663,15 @@ def train_model(
     oracle_width = model.config.hidden_size
     projector_key = activation_projector_key(cfg.target_model_name)
     activation_projector: torch.nn.Module | None = None
-    if target_width != oracle_width:
+
+    # A projector is required whenever the models differ, even when their hidden
+    # sizes happen to match: equal width does not imply equal activation bases.
+    # It is also required for any hidden-size mismatch.
+    needs_projector = (
+        cfg.oracle_model_name != cfg.target_model_name
+        or target_width != oracle_width
+    )
+    if needs_projector:
         activation_projector = make_activation_projector(
             target_width,
             oracle_width,
@@ -554,16 +680,18 @@ def train_model(
             dtype=dtype,
         )
         if rank == 0:
-            print(
-                "Hidden-size mismatch detected between target activations and oracle residual stream. "
-                f"Auto-enabling learned projection: target={cfg.target_model_name} ({target_width}) -> "
-                f"oracle={cfg.oracle_model_name} ({oracle_width}), bias={cfg.activation_projection_bias}."
+            reason = (
+                "different model identities"
+                if cfg.oracle_model_name != cfg.target_model_name
+                else "hidden-size mismatch"
             )
-    elif cfg.use_learned_activation_projection and rank == 0:
-        print(
-            "use_learned_activation_projection is set but hidden sizes already match "
-            f"({target_width}); projection is not needed and will not be used."
-        )
+            print(
+                "Enabling learned activation projection (" + reason + "): "
+                f"target={cfg.target_model_name} ({target_width}) -> "
+                f"oracle={cfg.oracle_model_name} ({oracle_width}), "
+                f"bias={cfg.activation_projection_bias}.",
+                flush=True,
+            )
 
     model.enable_input_require_grads()
 
@@ -632,6 +760,9 @@ def train_model(
     if activation_projector is not None:
         optimizer_params.extend(activation_projector.parameters())
     optimizer = torch.optim.AdamW(optimizer_params, lr=cfg.lr)
+    optimizer_param_names = _optimizer_parameter_names(
+        train_model_module, activation_projector, projector_key
+    )
 
     global_step_size = cfg.train_batch_size * world_size
     effective_steps = (len(training_data) // global_step_size) * global_step_size
@@ -676,12 +807,15 @@ def train_model(
     start_epoch = 0
 
     modules_to_restore = {projector_key: activation_projector} if activation_projector is not None else None
+    if rank == 0:
+        print(f"Checkpoint save_dir: {os.path.abspath(os.fspath(cfg.save_dir))}", flush=True)
     ckpt_global_step, ckpt_epoch, ckpt_extra = load_checkpoint_if_exists(
         cfg.save_dir,
         model,
         optimizer=optimizer,
         scheduler=scheduler,
         modules_to_restore=modules_to_restore,
+        optimizer_param_names=optimizer_param_names,
     )
     phase_start_global_step = 0
     updates_done_in_epoch = 0
@@ -759,6 +893,7 @@ def train_model(
                         if activation_projector is not None
                         else None
                     ),
+                    optimizer_param_names=optimizer_param_names,
                 )
             dist.barrier()
         except Exception as e:
@@ -831,6 +966,7 @@ def train_model(
                         if activation_projector is not None
                         else None
                     ),
+                    optimizer_param_names=optimizer_param_names,
                 )
             dist.barrier()
 
@@ -894,7 +1030,7 @@ def train_model(
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
-                if getattr(cfg, "eval_steps", None) and cfg.eval_steps > 0 and global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
+                if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         eval_all_datasets(
                             cfg,
@@ -912,7 +1048,7 @@ def train_model(
                     dist.barrier()
 
                 # Checkpoint on update steps
-                if getattr(cfg, "save_steps", None) and cfg.save_steps > 0 and (global_step % cfg.save_steps == 0) and global_step > 0:
+                if getattr(cfg, "save_steps", None) and (global_step % cfg.save_steps == 0) and global_step > 0:
                     if rank == 0:
                         rng = capture_rng_state()
                         ckpt_path = save_checkpoint(
@@ -930,6 +1066,7 @@ def train_model(
                                 if activation_projector is not None
                                 else None
                             ),
+                            optimizer_param_names=optimizer_param_names,
                         )
                         if verbose:
                             print(f"Saved checkpoint at {ckpt_path}")
@@ -982,6 +1119,7 @@ def train_model(
                     if activation_projector is not None
                     else None
                 ),
+                optimizer_param_names=optimizer_param_names,
             )
             print(f"Saved phase-boundary checkpoint at {ckpt_path} (global_step={global_step})")
         dist.barrier()
@@ -991,8 +1129,22 @@ def train_model(
         print("Training complete.")
         print("Saving final model...")
         model.save_pretrained(f"{cfg.save_dir}/final")
+        projector_bundle_path = save_final_projectors(
+            cfg.save_dir,
+            cfg.target_model_name,
+            activation_projector,
+        )
+        if projector_bundle_path is not None:
+            print(f"Saved final activation projector bundle to {projector_bundle_path}", flush=True)
+        elif cfg.oracle_model_name != cfg.target_model_name:
+            raise RuntimeError(
+                "Final activation projector export produced no bundle even though "
+                "oracle_model_name and target_model_name differ. "
+                f"save_dir={cfg.save_dir!r}, target={cfg.target_model_name!r}, "
+                f"activation_projector={type(activation_projector).__name__ if activation_projector is not None else None}."
+            )
 
-        print("Running final evaluation...")
+        print("Running final evaluation...", flush=True)
         eval_all_datasets(
             cfg,
             eval_datasets,
@@ -1029,7 +1181,10 @@ def train_model(
 def build_datasets(
     cfg: SelfInterpTrainingConfig,
     dataset_loaders: list[ActDatasetLoader],
-    max_len_percentile: float | None = None,
+    # Preserve the original trainer default: remove the top 0.1% longest
+    # materialized examples before batching, preventing rare length outliers
+    # from changing the old memory behavior.
+    max_len_percentile: float | None = 0.999,
     window_mult: int | None = 20,
 ) -> tuple[list[TrainingDataPoint], dict[str, list[TrainingDataPoint]]]:
     set_seed(cfg.seed)
@@ -1068,22 +1223,35 @@ def build_datasets(
         removed = before - len(all_training_data)
         print(f"Percentile trim: kept <= {threshold} tokens (p={p:.6f}). Removed {removed}/{before} examples.")
 
-    # Select after length trimming. Counts are enforced on materialized examples.
-    # The default is the paper's exact one-million-example distribution; CoT is
-    # an optional fourth family supplied through AO_MIXTURE_WEIGHTS and
-    # reallocates this fixed budget rather than increasing it.
-    before_mixture = len(all_training_data)
-    configured_total = int(os.environ.get("AO_MIXTURE_TOTAL_SAMPLES", "1000000"))
-    selected_training_data, manifest = select_training_mixture(
-        all_training_data,
-        seed=mixture_seed(cfg.seed),
-        total_examples=configured_total,
+    # Preserve the original behavior when no mixture parameters are supplied:
+    # use every cached/materialized training datapoint, then shuffle and apply
+    # the existing optional length grouping below. In particular, do not enforce
+    # the nominal 1,000,000-example quota against a smaller existing cache.
+    legacy_default = (
+        "AO_MIXTURE_WEIGHTS" not in os.environ
+        and "AO_MIXTURE_TOTAL_SAMPLES" not in os.environ
     )
-    all_training_data = selected_training_data
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        manifest_path = os.path.join(cfg.save_dir, "mixture_manifest.json")
-        manifest["pre_mixture_examples_after_trim"] = before_mixture
-        write_mixture_manifest(manifest, manifest_path)
+    if legacy_default:
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(
+                "AO default legacy mixture: using all cached training datapoints; "
+                "CoT disabled",
+                flush=True,
+            )
+    else:
+        # Explicit mixture settings opt into exact materialized-family quotas.
+        before_mixture = len(all_training_data)
+        selected_training_data, manifest = select_training_mixture(
+            all_training_data,
+            seed=mixture_seed(cfg.seed),
+            weights=mixture_weights(),
+            total_examples=mixture_total_samples(),
+        )
+        all_training_data = selected_training_data
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            manifest_path = os.path.join(cfg.save_dir, "mixture_manifest.json")
+            manifest["pre_mixture_examples_after_trim"] = before_mixture
+            write_mixture_manifest(manifest, manifest_path)
 
     set_seed(cfg.seed)
     random.shuffle(all_training_data)
@@ -1137,23 +1305,19 @@ def build_loader_groups(
     # candidates, enough for the default 570,000 quota.
     num_datapoints = 100_000
     latentqa_num_datapoints = 80_000
-    cot_num_datapoints = 60_000
-    # Mixture selection happens after materialization.  Provision enough CoT
-    # candidates for the requested quota instead of failing at selection time.
-    # The launcher stores percentages (for example 25), while mixture.py also
-    # accepts normalized weights (for example 0.25), so handle both forms.
-    try:
-        mixture_total = int(os.environ.get("AO_MIXTURE_TOTAL_SAMPLES", "1000000"))
-        raw_weights = json.loads(os.environ.get("AO_MIXTURE_WEIGHTS", "{}"))
-        raw_cot = float(raw_weights.get("cot_oracle", 0.0))
-        raw_total = sum(float(value) for value in raw_weights.values())
-        cot_weight = raw_cot / 100.0 if abs(raw_total - 100.0) < 1e-6 else raw_cot
-        requested_cot = math.ceil(mixture_total * cot_weight)
-        cot_num_datapoints = max(cot_num_datapoints, requested_cot)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        # Keep the historical pool size when this helper is called without the
-        # launcher's mixture environment variables.
-        pass
+
+    # CoT is optional.  With no mixture override, mixture.py supplies the
+    # original paper distribution, whose CoT weight is exactly zero.  Do not
+    # instantiate the CoT loader in that case: constructing it can materialize
+    # a large CoT dataset even though the sampler will discard every example.
+    configured_total = mixture_total_samples()
+    configured_weights = mixture_weights()
+    cot_weight = float(configured_weights.get("cot_oracle", 0.0))
+    cot_num_datapoints = (
+        max(60_000, math.ceil(configured_total * cot_weight))
+        if cot_weight > 0.0
+        else 0
+    )
 
     # DEBUG = True
 
@@ -1161,7 +1325,8 @@ def build_loader_groups(
         print("DEBUG mode: using small datasets")
         num_datapoints = 1_000
         latentqa_num_datapoints = 200
-        cot_num_datapoints = 200
+        # Preserve the enabled/disabled CoT decision in debug mode.
+        cot_num_datapoints = 200 if cot_num_datapoints > 0 else 0
 
     # PastLens: build both single-token and multi-token variants
     past_lens_single = PastLensDatasetLoader(
@@ -1212,22 +1377,24 @@ def build_loader_groups(
         )
     )
 
-    if CotOracleDatasetLoader is None or CotOracleDatasetConfig is None:
-        raise ImportError("CoT oracle dataset module is required for the training mixture")
+    cot_oracle_loader = None
+    if cot_num_datapoints > 0:
+        if CotOracleDatasetLoader is None or CotOracleDatasetConfig is None:
+            raise ImportError("CoT oracle dataset module is required for the requested mixture")
 
-    cot_oracle_loader = CotOracleDatasetLoader(
-        dataset_config=mk_cfg(
-            CotOracleDatasetConfig(),
-            num_train=cot_num_datapoints,
-            num_test=0,
-            splits=["train"],
-            model_name=model_name,
-            prompt_model_name=prompt_model_name,
-            layer_percents=layer_percents,
-            save_acts=False,
-            batch_size=act_collection_batch_size,
+        cot_oracle_loader = CotOracleDatasetLoader(
+            dataset_config=mk_cfg(
+                CotOracleDatasetConfig(),
+                num_train=cot_num_datapoints,
+                num_test=0,
+                splits=["train"],
+                model_name=model_name,
+                prompt_model_name=prompt_model_name,
+                layer_percents=layer_percents,
+                save_acts=False,
+                batch_size=act_collection_batch_size,
+            )
         )
-    )
 
     # SAE datasets per layer percent
     sae_loaders: list[ActDatasetLoader] = []
@@ -1352,7 +1519,7 @@ def build_loader_groups(
     return {
         "past_lens_loaders": [past_lens_single, past_lens_multi],
         "latentqa_loaders": [latent_qa_loader],
-        "cot_oracle_loaders": [cot_oracle_loader],
+        "cot_oracle_loaders": [cot_oracle_loader] if cot_oracle_loader is not None else [],
         "classification_loaders": classification_loaders,
         "sae_loaders": sae_loaders,
         "sae_explanation_loaders": sae_explanation_loaders,
@@ -1484,7 +1651,7 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 2
+    train_batch_size = 16
     gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
@@ -1505,7 +1672,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 8
+    gradient_accumulation_steps = 1
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(

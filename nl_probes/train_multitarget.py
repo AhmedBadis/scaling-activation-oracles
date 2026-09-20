@@ -9,9 +9,12 @@ exactly in the phase schedule:
     ...
 
 With --n_chunks 1, training is sequential over the target list. Each target gets
-its own activation projector checkpoint key through activation_projector_key().
-The projector implementation is imported from nl_probes.sft and is the gated
-residual MLP projector with legacy linear-checkpoint compatibility.
+its own activation projector key through activation_projector_key(). The
+projector implementation is imported from nl_probes.sft and is the gated
+residual MLP projector with legacy linear-checkpoint compatibility. Completed
+projectors are exported to the shared ``final/activation_projectors.pth`` bundle
+and all final evaluations load from that bundle rather than an intermediate
+checkpoint.
 
 This script intentionally reuses train_model() so optimizer, DDP, checkpoint,
 LoRA, evaluation, and signal-handling behavior stay aligned with the main SFT
@@ -335,25 +338,33 @@ def _load_projector_for_eval(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
-    projector_key = activation_projector_key(target_model_name)
-    projector_state = None
-    for checkpoint_path in _valid_checkpoint_candidates(save_dir):
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        except Exception as exc:
-            print(f"Skipping unreadable projector checkpoint {checkpoint_path}: {exc}", flush=True)
-            continue
-        module_states = checkpoint.get("module_states") or {}
-        if projector_key in module_states:
-            projector_state = module_states[projector_key]
-            break
-        if "activation_projector" in module_states:
-            projector_state = module_states["activation_projector"]
-            break
-
-    if projector_state is None:
+    """Load the completed target projector from the shared final artifact."""
+    bundle_path = os.path.join(save_dir, "final", "activation_projectors.pth")
+    if not os.path.isfile(bundle_path):
         raise RuntimeError(
-            f"No projector checkpoint found for target {target_model_name!r} under key {projector_key!r}."
+            f"Missing final projector bundle for target {target_model_name!r}: {bundle_path}. "
+            "The training phase must finish with final-projector export enabled."
+        )
+    try:
+        try:
+            bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            bundle = torch.load(bundle_path, map_location="cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Could not load final projector bundle {bundle_path}: {exc}") from exc
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("projectors"), dict):
+        raise RuntimeError(f"Invalid final projector bundle format: {bundle_path}")
+
+    projector_key = activation_projector_key(target_model_name)
+    projector_state = bundle["projectors"].get(projector_key)
+    if not isinstance(projector_state, dict):
+        available = sorted(
+            key for key, value in bundle["projectors"].items()
+            if isinstance(key, str) and isinstance(value, dict)
+        )
+        raise RuntimeError(
+            f"Final projector {projector_key!r} is missing from {bundle_path}; "
+            f"available projector keys: {available or 'none'}"
         )
 
     has_bias = "base.bias" in projector_state or "bias" in projector_state
@@ -364,7 +375,7 @@ def _load_projector_for_eval(
         device=device,
         dtype=dtype,
     )
-    projector.load_state_dict(projector_state)
+    projector.load_state_dict(projector_state, strict=True)
     projector.eval()
     return projector
 

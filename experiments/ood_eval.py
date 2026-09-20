@@ -1,12 +1,13 @@
 """Run the four open-ended Activation Oracle OOD evaluations.
 
-The local ``checkpoints_*/final`` adapter is the oracle/verbalizer.  Target
-models are loaded separately, because the experiments may use a target model
-that differs from the oracle model.
+The local ``checkpoints_*/final`` directory contains the oracle/verbalizer
+adapter and, when target and oracle widths differ, the final trained activation
+projector bundle.  Target models are loaded separately, because the experiments
+may use a target model that differs from the oracle model.
 
 When a compatible upstream target adapter exists it is used.  Otherwise this
 file builds a real target LoRA adapter from task records and saves it under
-``experiments/ood_target_adapters/``.  The build is deterministic and cached.  It is not a
+``ood_target_adapters/``.  The build is deterministic and cached.  It is not a
 zero adapter, an identity shortcut, a monkeypatch, or a result fallback.
 
 Only these evaluations are run, in this order:
@@ -583,7 +584,7 @@ def _persona_records(repo_root: Path) -> list[dict[str, Any]]:
 
 
 def _local_training_records(repo_root: Path, data_root: Path | None, task: str, value: str) -> list[dict[str, Any]] | None:
-    roots = [root for root in (data_root, repo_root / "experiments" / "ood_target_data") if root is not None]
+    roots = [root for root in (data_root, repo_root / "ood_target_data") if root is not None]
     candidates: list[Path] = []
     for root in roots:
         candidates.extend((
@@ -1301,62 +1302,24 @@ def _model_kwargs(model_name: str) -> dict[str, Any]:
     return kwargs
 
 
-def _checkpoint_number(path: Path) -> int:
+def _load_final_projector_bundle(final_dir: Path) -> dict[str, Any]:
+    """Load the completed projector bundle from the oracle's final directory."""
+    bundle_path = final_dir / "activation_projectors.pth"
+    if not bundle_path.is_file():
+        raise RuntimeError(
+            f"final projector bundle is missing for {final_dir}; "
+            "retrain/export the model with the final-projector saving code"
+        )
     try:
-        return int(path.stem.rsplit("_", 1)[-1])
-    except ValueError:
-        return -1
-
-
-def _find_latest_parent_checkpoint(checkpoint: Checkpoint) -> Path | None:
-    parent = checkpoint.final_dir.parent
-    paths = list(parent.glob("checkpoint_step_*.pth"))
-    if paths:
-        return max(paths, key=_checkpoint_number)
-    paths = list(parent.glob("checkpoint_epoch_*.pth"))
-    return max(paths, key=lambda path: (_checkpoint_number(path), path.stat().st_mtime)) if paths else None
-
-
-def _load_module_states(path: Path) -> dict[str, Any]:
-    try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(path, map_location="cpu")
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(f"parent checkpoint is not a mapping: {path}")
-    states = checkpoint.get("module_states")
-    return states if isinstance(states, dict) else {}
-
-
-def _projector_state(
-    states: dict[str, Any], key: str, target_model_name: str,
-) -> dict[str, Any] | None:
-    state = states.get(key)
-    if isinstance(state, dict):
-        return state
-
-    legacy = states.get("activation_projector")
-    if isinstance(legacy, dict):
-        return legacy
-
-    projector_states = {
-        name: value
-        for name, value in states.items()
-        if isinstance(name, str)
-        and name.startswith("activation_projector__")
-        and isinstance(value, dict)
-    }
-    target_signature = re.sub(r"[^a-z0-9]", "", sanitize_lora_name(target_model_name).lower())
-    matching = {
-        name: value
-        for name, value in projector_states.items()
-        if re.sub(r"[^a-z0-9]", "", name.split("__", 1)[1].lower()) == target_signature
-    }
-    if len(matching) == 1:
-        return next(iter(matching.values()))
-    if len(projector_states) == 1:
-        return next(iter(projector_states.values()))
-    return None
+        try:
+            bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            bundle = torch.load(bundle_path, map_location="cpu")
+    except Exception as exc:
+        raise RuntimeError(f"could not load final projector bundle {bundle_path}: {exc}") from exc
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("projectors"), dict):
+        raise RuntimeError(f"invalid final projector bundle format: {bundle_path}")
+    return bundle
 
 
 def _restore_projector(
@@ -1365,23 +1328,22 @@ def _restore_projector(
 ) -> torch.nn.Module | None:
     if target_width == oracle_width:
         return None
-    parent_checkpoint = _find_latest_parent_checkpoint(checkpoint)
-    if parent_checkpoint is None:
-        raise RuntimeError(f"no parent checkpoint with a trained projector exists for {checkpoint.name}")
-    states = _load_module_states(parent_checkpoint)
+
+    bundle = _load_final_projector_bundle(checkpoint.final_dir)
+    projectors = bundle["projectors"]
     key = f"activation_projector__{sanitize_lora_name(target_model_name)}"
-    state = _projector_state(states, key, target_model_name)
-    if state is None:
+    state = projectors.get(key)
+    if not isinstance(state, dict):
         available = sorted(
-            name for name, value in states.items()
-            if isinstance(name, str)
-            and name.startswith("activation_projector")
-            and isinstance(value, dict)
+            name for name, value in projectors.items()
+            if isinstance(name, str) and isinstance(value, dict)
         )
         raise RuntimeError(
-            f"trained projector {key!r} is missing from {parent_checkpoint.name}; "
+            f"trained final projector {key!r} is missing from "
+            f"{checkpoint.final_dir / 'activation_projectors.pth'}; "
             f"available projector keys: {available or 'none'}"
         )
+
     projector = GatedResidualMLPProjector(
         target_width, oracle_width, bias=("base.bias" in state or "bias" in state),
         device=device, dtype=dtype,
@@ -1676,7 +1638,7 @@ def main() -> int:
     if args.target_adapter_manifest is not None and not args.target_adapter_manifest.is_absolute():
         args.target_adapter_manifest = args.repo_root / args.target_adapter_manifest
     if args.target_adapter_cache is None:
-        args.target_adapter_cache = args.repo_root / "experiments" / "ood_target_adapters"
+        args.target_adapter_cache = args.repo_root / "ood_target_adapters"
     elif not args.target_adapter_cache.is_absolute():
         args.target_adapter_cache = args.repo_root / args.target_adapter_cache
     if args.target_data_root is not None and not args.target_data_root.is_absolute():
