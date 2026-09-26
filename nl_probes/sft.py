@@ -85,12 +85,81 @@ def activation_projector_key(target_model_name: str) -> str:
     return f"activation_projector__{sanitize_lora_name(target_model_name)}"
 
 
+PROJECTOR_TYPES = ("linear", "gated_residual_mlp")
+PROJECTOR_INITS = ("random", "identity")
+DEFAULT_PROJECTOR_TYPE = "gated_residual_mlp"
+DEFAULT_PROJECTOR_INIT = "identity"
+
+
+def validate_projector_options(projector_type: str, projector_init: str) -> tuple[str, str]:
+    if projector_type not in PROJECTOR_TYPES:
+        raise ValueError(
+            f"Unsupported projector_type={projector_type!r}; "
+            f"expected one of {PROJECTOR_TYPES}."
+        )
+    if projector_init not in PROJECTOR_INITS:
+        raise ValueError(
+            f"Unsupported projector_init={projector_init!r}; "
+            f"expected one of {PROJECTOR_INITS}."
+        )
+    return projector_type, projector_init
+
+
+def _initialize_truncated_identity(linear: torch.nn.Linear) -> None:
+    with torch.no_grad():
+        linear.weight.zero_()
+        diagonal = min(linear.in_features, linear.out_features)
+        indices = torch.arange(diagonal, device=linear.weight.device)
+        linear.weight[indices, indices] = 1
+        if linear.bias is not None:
+            linear.bias.zero_()
+
+
+class LinearProjector(torch.nn.Module):
+    """A direct affine activation projector."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        bias: bool = True,
+        init_mode: str = DEFAULT_PROJECTOR_INIT,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        if init_mode not in PROJECTOR_INITS:
+            raise ValueError(f"Unsupported projector_init={init_mode!r}")
+        self.linear = torch.nn.Linear(input_dim, output_dim, bias=bias, device=device, dtype=dtype)
+        self.projector_type = "linear"
+        self.projector_init = init_mode
+        if init_mode == "identity":
+            _initialize_truncated_identity(self.linear)
+
+    @property
+    def in_features(self) -> int:
+        return self.linear.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.linear.out_features
+
+    @property
+    def bias_enabled(self) -> bool:
+        return self.linear.bias is not None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+
 class GatedResidualMLPProjector(torch.nn.Module):
     """Stable nonlinear target-to-oracle activation projector.
 
-    The learned linear path preserves the original projector's global alignment. A
-    zero-initialized residual MLP learns nonlinear corrections without changing the
-    initial function at startup.
+    The learned linear path preserves the global alignment. A zero-initialized
+    residual MLP learns nonlinear corrections without changing the initial
+    function at startup.
     """
 
     def __init__(
@@ -100,12 +169,15 @@ class GatedResidualMLPProjector(torch.nn.Module):
         *,
         bias: bool = True,
         hidden_dim: int | None = None,
+        init_mode: str = DEFAULT_PROJECTOR_INIT,
         residual_scale_init: float = 1e-2,
         eps: float = 1e-6,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        if init_mode not in PROJECTOR_INITS:
+            raise ValueError(f"Unsupported projector_init={init_mode!r}")
         if hidden_dim is None:
             hidden_dim = max(512, min(2048, 2 * min(input_dim, output_dim) // 3))
 
@@ -116,34 +188,36 @@ class GatedResidualMLPProjector(torch.nn.Module):
         self.residual_scale = torch.nn.Parameter(
             torch.tensor(residual_scale_init, device=device, dtype=dtype)
         )
+        self.projector_type = "gated_residual_mlp"
+        self.projector_init = init_mode
 
-        # Start exactly as the established linear projector; the residual branch is
-        # enabled smoothly as its zero-initialized output weights learn.
+        # The residual branch always starts at zero, so identity initialization
+        # makes the complete module exactly the truncated identity.
         torch.nn.init.zeros_(self.up.weight)
+        if init_mode == "identity":
+            _initialize_truncated_identity(self.base)
+
+    @property
+    def in_features(self) -> int:
+        return self.base.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.base.out_features
+
+    @property
+    def bias_enabled(self) -> bool:
+        return self.base.bias is not None
+
+    @property
+    def hidden_features(self) -> int:
+        return self.down.out_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.base(x) + self.residual_scale * self.up(
             torch.nn.functional.silu(self.norm(self.down(x)))
         )
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
-        # Migrate legacy checkpoints containing only Linear.weight/bias. The new
-        # residual branch remains at its safe startup initialization.
-        legacy_weight = prefix + "weight"
-        legacy_bias = prefix + "bias"
-        new_weight = prefix + "base.weight"
-        new_bias = prefix + "base.bias"
-        if legacy_weight in state_dict and new_weight not in state_dict:
-            state_dict[new_weight] = state_dict.pop(legacy_weight)
-            if self.base.bias is not None and legacy_bias in state_dict:
-                state_dict[new_bias] = state_dict.pop(legacy_bias)
-            for name, value in self.state_dict().items():
-                key = prefix + name
-                if key not in state_dict:
-                    state_dict[key] = value.detach().clone()
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        )
 
 
 def make_activation_projector(
@@ -153,14 +227,66 @@ def make_activation_projector(
     bias: bool,
     device: torch.device,
     dtype: torch.dtype,
-) -> GatedResidualMLPProjector:
+    projector_type: str = DEFAULT_PROJECTOR_TYPE,
+    projector_init: str = DEFAULT_PROJECTOR_INIT,
+    hidden_dim: int | None = None,
+) -> torch.nn.Module:
+    projector_type, projector_init = validate_projector_options(projector_type, projector_init)
+    if projector_type == "linear":
+        return LinearProjector(
+            input_dim,
+            output_dim,
+            bias=bias,
+            init_mode=projector_init,
+            device=device,
+            dtype=dtype,
+        )
     return GatedResidualMLPProjector(
         input_dim,
         output_dim,
         bias=bias,
+        hidden_dim=hidden_dim,
+        init_mode=projector_init,
         device=device,
         dtype=dtype,
     )
+
+
+def infer_projector_type_from_state(state_dict: dict[str, Any]) -> str | None:
+    """Infer a projector type only from unambiguous state-key layouts."""
+    keys = {key.removeprefix("module.") for key in state_dict if isinstance(key, str)}
+    if any(key == "base.weight" or key.startswith("base.") for key in keys):
+        return "gated_residual_mlp"
+    if any(key == "linear.weight" or key.startswith("linear.") for key in keys):
+        return "linear"
+    if "weight" in keys or "bias" in keys:
+        return "linear"
+    if any(key.startswith(prefix) for key in keys for prefix in ("down.", "norm.", "up.", "residual_scale")):
+        return "gated_residual_mlp"
+    return None
+
+
+def infer_projector_hidden_dim_from_state(state_dict: dict[str, Any]) -> int | None:
+    """Infer a gated-projector hidden width from legacy tensor shapes."""
+    normalized = {
+        key.removeprefix("module."): value
+        for key, value in state_dict.items()
+        if isinstance(key, str)
+    }
+    candidates: list[int] = []
+    down_weight = normalized.get("down.weight")
+    if isinstance(down_weight, torch.Tensor) and down_weight.ndim == 2:
+        candidates.append(int(down_weight.shape[0]))
+    up_weight = normalized.get("up.weight")
+    if isinstance(up_weight, torch.Tensor) and up_weight.ndim == 2:
+        candidates.append(int(up_weight.shape[1]))
+    norm_weight = normalized.get("norm.weight")
+    if isinstance(norm_weight, torch.Tensor) and norm_weight.ndim == 1:
+        candidates.append(int(norm_weight.shape[0]))
+    if candidates and len(set(candidates)) == 1:
+        return candidates[0]
+    return None
+
 
 
 FINAL_PROJECTOR_BUNDLE_NAME = "activation_projectors.pth"
@@ -205,17 +331,11 @@ def save_final_projectors(
     target_model_name: str,
     activation_projector: torch.nn.Module | None,
 ) -> Path | None:
-    """Save final projector state(s) under ``final/``.
-
-    The current in-memory projector is authoritative. Existing final entries
-    are preserved so phased multi-target runs keep projectors from earlier
-    targets, while checkpoint states fill any missing entries.
-    """
+    """Save final projector state(s) under ``final/`` without labels."""
     final_dir = Path(save_dir) / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
     bundle_path = final_dir / FINAL_PROJECTOR_BUNDLE_NAME
     projectors: dict[str, dict[str, Any]] = {}
-    metadata: dict[str, dict[str, Any]] = {}
 
     if bundle_path.is_file():
         try:
@@ -228,37 +348,21 @@ def save_final_projectors(
                         for key, state in previous_projectors.items()
                         if isinstance(key, str) and isinstance(state, dict)
                     })
-                previous_metadata = previous.get("metadata", {})
-                if isinstance(previous_metadata, dict):
-                    metadata.update(previous_metadata)
         except Exception as exc:
             print(f"Warning: could not read existing final projector bundle: {exc}")
 
-    # Fill missing target entries from the cumulative checkpoint state, but do
-    # not overwrite an already-exported final state with an intermediate one.
+    # Fill missing target entries from cumulative checkpoint module states.
     for key, state in _projector_states_from_latest_checkpoint(save_dir).items():
         projectors.setdefault(key, state)
 
     if activation_projector is not None:
         current_key = activation_projector_key(target_model_name)
         projectors[current_key] = _cpu_state_dict(activation_projector.state_dict())
-        metadata[current_key] = {
-            "target_model_name": target_model_name,
-            "input_dim": int(activation_projector.base.in_features),
-            "output_dim": int(activation_projector.base.out_features),
-        }
 
     if not projectors:
         return None
 
-    atomic_save(
-        {
-            "format_version": 1,
-            "projectors": projectors,
-            "metadata": metadata,
-        },
-        str(bundle_path),
-    )
+    atomic_save({"projectors": projectors}, str(bundle_path))
     return bundle_path
 
 
@@ -672,12 +776,20 @@ def train_model(
         or target_width != oracle_width
     )
     if needs_projector:
+        requested_projector_type = getattr(cfg, "projector_type", DEFAULT_PROJECTOR_TYPE)
+        requested_projector_init = getattr(cfg, "projector_init", DEFAULT_PROJECTOR_INIT)
+        projector_type_for_construction = requested_projector_type
+        projector_bias_for_construction = cfg.activation_projection_bias
+        projector_hidden_dim_for_construction: int | None = None
         activation_projector = make_activation_projector(
             target_width,
             oracle_width,
-            bias=cfg.activation_projection_bias,
+            bias=projector_bias_for_construction,
             device=device,
             dtype=dtype,
+            projector_type=projector_type_for_construction,
+            projector_init=requested_projector_init,
+            hidden_dim=projector_hidden_dim_for_construction,
         )
         if rank == 0:
             reason = (
@@ -689,9 +801,12 @@ def train_model(
                 "Enabling learned activation projection (" + reason + "): "
                 f"target={cfg.target_model_name} ({target_width}) -> "
                 f"oracle={cfg.oracle_model_name} ({oracle_width}), "
-                f"bias={cfg.activation_projection_bias}.",
+                f"bias={bool(getattr(activation_projector, 'bias_enabled', projector_bias_for_construction))}, "
+                f"type={getattr(activation_projector, 'projector_type', projector_type_for_construction)}, "
+                f"init={getattr(activation_projector, 'projector_init', requested_projector_init)}.",
                 flush=True,
             )
+
 
     model.enable_input_require_grads()
 
@@ -806,7 +921,11 @@ def train_model(
     global_step = 0
     start_epoch = 0
 
-    modules_to_restore = {projector_key: activation_projector} if activation_projector is not None else None
+    modules_to_restore = (
+        {projector_key: activation_projector}
+        if activation_projector is not None
+        else None
+    )
     if rank == 0:
         print(f"Checkpoint save_dir: {os.path.abspath(os.fspath(cfg.save_dir))}", flush=True)
     ckpt_global_step, ckpt_epoch, ckpt_extra = load_checkpoint_if_exists(
@@ -1565,13 +1684,44 @@ if __name__ == "__main__":
     import sys
     oracle_model_name = None
     target_model_name = None
+    projector_type = DEFAULT_PROJECTOR_TYPE
+    projector_init = DEFAULT_PROJECTOR_INIT
     
-    # Simple CLI parsing for model overrides
-    for i, arg in enumerate(sys.argv[1:]):
+    # Simple CLI parsing for model/projector overrides. Accept both
+    # ``--flag=value`` and the standard ``--flag value`` spelling.
+    cli_args = sys.argv[1:]
+    i = 0
+    while i < len(cli_args):
+        arg = cli_args[i]
         if arg.startswith("--oracle_model_name="):
             oracle_model_name = arg.split("=", 1)[1]
+        elif arg == "--oracle_model_name":
+            if i + 1 >= len(cli_args):
+                raise ValueError("--oracle_model_name requires a value")
+            oracle_model_name = cli_args[i + 1]
+            i += 1
         elif arg.startswith("--target_model_name="):
             target_model_name = arg.split("=", 1)[1]
+        elif arg == "--target_model_name":
+            if i + 1 >= len(cli_args):
+                raise ValueError("--target_model_name requires a value")
+            target_model_name = cli_args[i + 1]
+            i += 1
+        elif arg.startswith("--projector_type="):
+            projector_type = arg.split("=", 1)[1]
+        elif arg == "--projector_type":
+            if i + 1 >= len(cli_args):
+                raise ValueError("--projector_type requires a value")
+            projector_type = cli_args[i + 1]
+            i += 1
+        elif arg.startswith("--projector_init="):
+            projector_init = arg.split("=", 1)[1]
+        elif arg == "--projector_init":
+            if i + 1 >= len(cli_args):
+                raise ValueError("--projector_init requires a value")
+            projector_init = cli_args[i + 1]
+            i += 1
+        i += 1
     
     # Load config with potential CLI overrides
     cfg = SelfInterpTrainingConfig()
@@ -1579,6 +1729,9 @@ if __name__ == "__main__":
         cfg.oracle_model_name = oracle_model_name
     if target_model_name is not None:
         cfg.target_model_name = target_model_name
+    cfg.projector_type, cfg.projector_init = validate_projector_options(
+        projector_type, projector_init
+    )
     
     # Sanity check
     if local_rank == 0:
@@ -1651,7 +1804,7 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 16
+    train_batch_size = 8
     gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
@@ -1672,7 +1825,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 2
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(

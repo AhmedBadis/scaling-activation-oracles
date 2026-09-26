@@ -35,6 +35,8 @@ PY
 
 torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --oracle_model_name="Qwen/Qwen3-1.7B" \
+  --projector_type="gated_residual_mlp" \
+  --projector_init="identity" \
   --target_model="Qwen/Qwen3-4B" \
   --target_model="Qwen/Qwen3.5-4B" \
   --wandb_suffix="_16_PT_MLP_o1.7t4T4" \
@@ -50,4 +52,4 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --classification_percent=24 \
   --spqa_percent=4 \
   --mixture_seed=42 \
-  --mixture_total_samples=1000000
+  --mixture_total_samples=1000000 \

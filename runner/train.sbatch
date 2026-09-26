@@ -45,4 +45,6 @@ NUM_GPUS=1
 # run training with torchrun
 # adjust nl_probes/sft.py args as needed, e.g., --config config.yaml --batch-size 8
 torchrun --nproc_per_node=$NUM_GPUS nl_probes/sft.py \
+  --projector_type="linear" \
+  --projector_init="identity" \
   --output_dir outputs/train

@@ -11,7 +11,7 @@ exactly in the phase schedule:
 With --n_chunks 1, training is sequential over the target list. Each target gets
 its own activation projector key through activation_projector_key(). The
 projector implementation is imported from nl_probes.sft and is the gated
-residual MLP projector with legacy linear-checkpoint compatibility. Completed
+residual MLP projector with state-only projector export. Completed
 projectors are exported to the shared ``final/activation_projectors.pth`` bundle
 and all final evaluations load from that bundle rather than an intermediate
 checkpoint.
@@ -45,6 +45,10 @@ from nl_probes.sft import (
     build_datasets,
     build_loader_groups,
     make_activation_projector,
+    infer_projector_hidden_dim_from_state,
+    validate_projector_options,
+    DEFAULT_PROJECTOR_TYPE,
+    DEFAULT_PROJECTOR_INIT,
     train_model,
 )
 from nl_probes.utils.activation_utils import get_hf_submodule
@@ -88,6 +92,14 @@ def _classification_datasets(num_targets: int) -> dict[str, dict[str, Any]]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oracle_model_name", type=str, required=True)
+    parser.add_argument(
+        "--projector_type", choices=("linear", "gated_residual_mlp"),
+        default=DEFAULT_PROJECTOR_TYPE,
+    )
+    parser.add_argument(
+        "--projector_init", choices=("random", "identity"),
+        default=DEFAULT_PROJECTOR_INIT,
+    )
     parser.add_argument(
         "--target_model",
         action="append",
@@ -337,6 +349,8 @@ def _load_projector_for_eval(
     oracle_width: int,
     device: torch.device,
     dtype: torch.dtype,
+    cfg_projector_type: str,
+    cfg_projector_init: str,
 ) -> torch.nn.Module:
     """Load the completed target projector from the shared final artifact."""
     bundle_path = os.path.join(save_dir, "final", "activation_projectors.pth")
@@ -367,13 +381,27 @@ def _load_projector_for_eval(
             f"available projector keys: {available or 'none'}"
         )
 
-    has_bias = "base.bias" in projector_state or "bias" in projector_state
+    projector_type = cfg_projector_type
+    projector_init = cfg_projector_init
+    hidden_dim = (
+        infer_projector_hidden_dim_from_state(projector_state)
+        if projector_type == "gated_residual_mlp"
+        else None
+    )
+    has_bias = (
+        "base.bias" in projector_state
+        or "linear.bias" in projector_state
+        or "bias" in projector_state
+    )
     projector = make_activation_projector(
         target_width,
         oracle_width,
-        bias=has_bias,
+        bias=bool(has_bias),
         device=device,
         dtype=dtype,
+        projector_type=projector_type,
+        projector_init=projector_init,
+        hidden_dim=int(hidden_dim) if projector_type == "gated_residual_mlp" and hidden_dim is not None else None,
     )
     projector.load_state_dict(projector_state, strict=True)
     projector.eval()
@@ -417,7 +445,10 @@ def _eval_target(
     target_width = target_model.config.hidden_size
     oracle_width = oracle_model.config.hidden_size
     projector = None
-    if target_width != oracle_width:
+    if (
+        target_model_name != cfg.oracle_model_name
+        or target_width != oracle_width
+    ):
         projector = _load_projector_for_eval(
             save_dir=cfg.save_dir,
             target_model_name=target_model_name,
@@ -425,6 +456,8 @@ def _eval_target(
             oracle_width=oracle_width,
             device=device,
             dtype=dtype,
+            cfg_projector_type=cfg.projector_type,
+            cfg_projector_init=cfg.projector_init,
         )
 
     submodule = get_hf_submodule(oracle_model, cfg.hook_onto_layer)
@@ -511,8 +544,11 @@ def _run_phase(
     layer_percents: List[int],
     oracle_model_name: str,
     target_models: list[str],
+    projector_type: str,
+    projector_init: str,
 ) -> str:
     cfg.target_model_name = target_model_name
+    cfg.projector_type, cfg.projector_init = validate_projector_options(projector_type, projector_init)
     cfg.load_lora_path = load_lora_path
     cfg.hook_onto_layer = hook_onto_layer
     cfg.hf_repo_name = "N/A"
@@ -822,6 +858,8 @@ def main() -> None:
             layer_percents=args.layer_percents,
             oracle_model_name=args.oracle_model_name,
             target_models=target_models,
+            projector_type=args.projector_type,
+            projector_init=args.projector_init,
         )
         lora_path = os.path.join(save_dir, "final")
 
@@ -838,6 +876,9 @@ def main() -> None:
         )
         eval_cfg.hook_onto_layer = args.hook_onto_layer
         eval_cfg.layer_percents = args.layer_percents
+        eval_cfg.projector_type, eval_cfg.projector_init = validate_projector_options(
+            args.projector_type, args.projector_init
+        )
         eval_cfg.finalize(dataset_loaders=loaders)
         all_target_scores[target_model_name] = _eval_target(
             cfg=eval_cfg,

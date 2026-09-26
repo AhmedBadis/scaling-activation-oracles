@@ -46,6 +46,13 @@ from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.dataset_utils import create_training_datapoint
 from nl_probes.utils.eval import run_evaluation
 from nl_probes.utils.lora_utils import sanitize_lora_name
+from nl_probes.sft import (
+    DEFAULT_PROJECTOR_INIT,
+    DEFAULT_PROJECTOR_TYPE,
+    infer_projector_type_from_state,
+    infer_projector_hidden_dim_from_state,
+    make_activation_projector,
+)
 
 
 TASKS = ("taboo", "ssc", "gender", "personaqa")
@@ -139,59 +146,6 @@ class TaskResult:
     score: float
     reason: str | None = None
 
-
-class GatedResidualMLPProjector(torch.nn.Module):
-    """Project target residuals into the oracle residual width."""
-
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        *,
-        bias: bool = True,
-        hidden_dim: int | None = None,
-        residual_scale_init: float = 1e-2,
-        eps: float = 1e-6,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__()
-        if hidden_dim is None:
-            hidden_dim = max(512, min(2048, 2 * min(input_dim, output_dim) // 3))
-        self.base = torch.nn.Linear(input_dim, output_dim, bias=bias, device=device, dtype=dtype)
-        self.down = torch.nn.Linear(input_dim, hidden_dim, bias=True, device=device, dtype=dtype)
-        self.norm = torch.nn.RMSNorm(hidden_dim, eps=eps, device=device, dtype=dtype)
-        self.up = torch.nn.Linear(hidden_dim, output_dim, bias=False, device=device, dtype=dtype)
-        self.residual_scale = torch.nn.Parameter(
-            torch.tensor(residual_scale_init, device=device, dtype=dtype)
-        )
-        torch.nn.init.zeros_(self.up.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base(x) + self.residual_scale * self.up(
-            torch.nn.functional.silu(self.norm(self.down(x)))
-        )
-
-    def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys,
-        unexpected_keys, error_msgs,
-    ):
-        legacy_weight = prefix + "weight"
-        legacy_bias = prefix + "bias"
-        new_weight = prefix + "base.weight"
-        new_bias = prefix + "base.bias"
-        if legacy_weight in state_dict and new_weight not in state_dict:
-            state_dict[new_weight] = state_dict.pop(legacy_weight)
-            if self.base.bias is not None and legacy_bias in state_dict:
-                state_dict[new_bias] = state_dict.pop(legacy_bias)
-            for name, value in self.state_dict().items():
-                key = prefix + name
-                if key not in state_dict:
-                    state_dict[key] = value.detach().clone()
-        super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys,
-            unexpected_keys, error_msgs,
-        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1326,7 +1280,7 @@ def _restore_projector(
     checkpoint: Checkpoint, target_model_name: str, target_width: int, oracle_width: int,
     device: torch.device, dtype: torch.dtype,
 ) -> torch.nn.Module | None:
-    if target_width == oracle_width:
+    if target_width == oracle_width and target_model_name == (checkpoint.target_model or target_model_name):
         return None
 
     bundle = _load_final_projector_bundle(checkpoint.final_dir)
@@ -1344,9 +1298,27 @@ def _restore_projector(
             f"available projector keys: {available or 'none'}"
         )
 
-    projector = GatedResidualMLPProjector(
-        target_width, oracle_width, bias=("base.bias" in state or "bias" in state),
-        device=device, dtype=dtype,
+    projector_type = infer_projector_type_from_state(state) or DEFAULT_PROJECTOR_TYPE
+    projector_init = DEFAULT_PROJECTOR_INIT
+    hidden_dim = (
+        infer_projector_hidden_dim_from_state(state)
+        if projector_type == "gated_residual_mlp"
+        else None
+    )
+    bias = (
+        "base.bias" in state
+        or "linear.bias" in state
+        or "bias" in state
+    )
+    projector = make_activation_projector(
+        target_width,
+        oracle_width,
+        bias=bool(bias),
+        device=device,
+        dtype=dtype,
+        projector_type=projector_type,
+        projector_init=projector_init,
+        hidden_dim=int(hidden_dim) if projector_type == "gated_residual_mlp" and hidden_dim is not None else None,
     )
     projector.load_state_dict(state, strict=True)
     projector.eval()

@@ -174,12 +174,15 @@ def save_checkpoint(
 
     merged_module_states: dict[str, dict[str, Any]] = {}
     prev_ckpt_path = find_latest_checkpoint(save_dir)
+    prev_ckpt: dict[str, Any] = {}
     if prev_ckpt_path is not None and os.path.abspath(prev_ckpt_path) != os.path.abspath(path):
         try:
-            prev_ckpt = _load_torch(prev_ckpt_path)
-            merged_module_states.update(prev_ckpt.get("module_states") or {})
+            loaded_previous = _load_torch(prev_ckpt_path)
+            if isinstance(loaded_previous, dict):
+                prev_ckpt = loaded_previous
+                merged_module_states.update(prev_ckpt.get("module_states") or {})
         except Exception as exc:
-            print(f"[checkpointing] Warning: failed to load previous module_states for merge: {exc}")
+            print(f"[checkpointing] Warning: failed to load previous module state/metadata for merge: {exc}")
     merged_module_states.update(module_states or {})
 
     optimizer_state = None
@@ -292,152 +295,6 @@ def _checkpoint_has_current_model_parameters(
     return True
 
 
-def _map_legacy_module_parameter(
-    state_key: str,
-    current_extra_names: list[str],
-) -> str | None:
-    """Map old standalone-projector state names to current optimizer names."""
-    if not current_extra_names:
-        return None
-
-    # The original projector was torch.nn.Linear, whose state keys were simply
-    # ``weight`` and ``bias``.  The current projector keeps that path under
-    # ``base`` and adds a residual branch.
-    if state_key in {"weight", "bias"}:
-        preferred_suffix = ".base." + state_key
-        candidates = [
-            name for name in current_extra_names
-            if name.endswith(preferred_suffix)
-        ]
-        if len(candidates) == 1:
-            return candidates[0]
-
-    candidates = [
-        name for name in current_extra_names
-        if name.endswith("." + state_key) or name == state_key
-    ]
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def _infer_legacy_optimizer_names(
-    checkpoint: dict[str, Any],
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    current_names: list[list[str]] | None,
-) -> list[list[str]] | None:
-    """Reconstruct names for pre-v2 checkpoints that stored only numeric IDs.
-
-    The trainer historically built one optimizer group as:
-
-        model parameters, followed by activation-projector parameters.
-
-    The model state dict and ``module_states`` preserve the order and identities
-    needed to recover that layout.  Projector keys ``weight``/``bias`` are also
-    migrated to the current ``base.weight``/``base.bias`` names.  If the layout
-    cannot be recovered unambiguously, this returns ``None`` and the caller can
-    apply the strict legacy fallback rather than guessing.
-    """
-    if current_names is None:
-        return None
-
-    current_names = [list(group) for group in current_names]
-    current_flat_names = [name for group in current_names for name in group]
-    current_flat_params = [
-        parameter
-        for group in optimizer.param_groups
-        for parameter in group["params"]
-    ]
-    if len(current_flat_names) != len(current_flat_params):
-        return None
-
-    saved_optimizer = checkpoint.get("optimizer_state_dict")
-    if not isinstance(saved_optimizer, dict):
-        return None
-    saved_groups = saved_optimizer.get("param_groups")
-    if not isinstance(saved_groups, list):
-        return None
-    saved_total = sum(
-        len(group.get("params", []))
-        for group in saved_groups
-        if isinstance(group, dict)
-    )
-    if saved_total == 0:
-        return None
-
-    model_parameters = list(model.parameters())
-    model_count = len(model_parameters)
-    if model_count > len(current_flat_names) or saved_total < model_count:
-        return None
-    if not _checkpoint_has_current_model_parameters(
-        checkpoint.get("model_state_dict"), model
-    ):
-        return None
-
-    # The model portion is unchanged and is always the prefix used when the
-    # optimizer was constructed.  Only the projector tail may differ.
-    reconstructed = current_flat_names[:model_count]
-    saved_extra_count = saved_total - model_count
-    current_extra_names = current_flat_names[model_count:]
-
-    if saved_extra_count:
-        module_states = checkpoint.get("module_states") or {}
-        if not isinstance(module_states, dict):
-            return None
-
-        candidates: list[tuple[str, list[str]]] = []
-        current_prefixes = {
-            name.split(".", 1)[0]
-            for name in current_extra_names
-            if "." in name
-        }
-        for module_key, module_state in module_states.items():
-            if not isinstance(module_key, str) or not isinstance(module_state, dict):
-                continue
-            state_parameter_keys = [
-                key
-                for key, value in module_state.items()
-                if isinstance(key, str) and isinstance(value, torch.Tensor)
-            ]
-            mapped = []
-            for state_key in state_parameter_keys:
-                mapped_name = _map_legacy_module_parameter(
-                    state_key, current_extra_names
-                )
-                if mapped_name is not None:
-                    mapped.append(mapped_name)
-            if len(mapped) != saved_extra_count:
-                continue
-            if len(set(mapped)) != len(mapped):
-                continue
-            candidates.append((module_key, mapped))
-
-        # Prefer a target-specific current key.  Otherwise a single legacy
-        # projector state is safe; multiple indistinguishable targets are not.
-        exact_candidates = [
-            mapped
-            for module_key, mapped in candidates
-            if module_key in current_prefixes
-        ]
-        if len(exact_candidates) == 1:
-            reconstructed.extend(exact_candidates[0])
-        elif len(candidates) == 1:
-            reconstructed.extend(candidates[0][1])
-        else:
-            return None
-
-    if len(reconstructed) != saved_total:
-        return None
-
-    saved_group_sizes = [len(group.get("params", [])) for group in saved_groups]
-    result = []
-    offset = 0
-    for size in saved_group_sizes:
-        result.append(reconstructed[offset : offset + size])
-        offset += size
-    return result
-
 
 def _match_groups_by_names(
     saved_names: list[list[str]],
@@ -471,7 +328,6 @@ def _remap_optimizer_state(
     *,
     current_names: list[list[str]] | None,
     saved_names: list[list[str]] | None,
-    allow_legacy_positional_extension: bool,
 ) -> None:
     """Restore optimizer state onto the current parameter objects by name.
 
@@ -554,7 +410,9 @@ def _remap_optimizer_state(
                 saved_group["params"],
                 current_ids[: len(saved_group["params"])],
                 current_params[: len(saved_group["params"])],
-                [f"group{current_group_index}[{index}]" for index in range(len(saved_group["params"]))],
+                current_names_group[: len(saved_group["params"])]
+                if current_names is not None
+                else [f"group{current_group_index}[{index}]" for index in range(len(saved_group["params"]))],
             )
         else:
             pairs = []
@@ -601,13 +459,12 @@ def _remap_optimizer_state(
                 if key != "params":
                     remapped_groups[current_index][key] = copy.deepcopy(value)
 
-    if saved_names is None and not allow_legacy_positional_extension:
+    if saved_names is None:
         saved_count = sum(len(group["params"]) for group in saved_groups)
         current_count = sum(len(group["params"]) for group in current_groups)
         if saved_count != current_count:
             raise ValueError(
-                "Legacy checkpoint optimizer layout differs from the current layout "
-                "and cannot be safely restored without parameter names"
+                "Checkpoint optimizer layout differs from the current layout"
             )
 
     optimizer.load_state_dict({"state": remapped_state, "param_groups": remapped_groups})
@@ -678,33 +535,11 @@ def load_checkpoint_if_exists(
         saved_optimizer_state = ckpt.get("optimizer_state_dict")
         if saved_optimizer_state is not None:
             saved_names = ckpt.get("optimizer_param_names")
-            legacy_extension = saved_names is None
-            if legacy_extension:
-                saved_names = _infer_legacy_optimizer_names(
-                    ckpt,
-                    model,
-                    optimizer,
-                    current_names,
-                )
-                if saved_names is not None:
-                    print(
-                        "[checkpointing] Reconstructed legacy optimizer parameter names "
-                        "from model/module state; restoring optimizer moments by name.",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        "[checkpointing] Loading a legacy checkpoint without optimizer "
-                        "parameter names; restoring by validated parameter order. "
-                        "New checkpoints store names.",
-                        flush=True,
-                    )
             _remap_optimizer_state(
                 optimizer,
                 saved_optimizer_state,
                 current_names=current_names,
                 saved_names=saved_names,
-                allow_legacy_positional_extension=legacy_extension and saved_names is None,
             )
 
     _load_scheduler_state(scheduler, ckpt.get("scheduler_state_dict"))
@@ -712,9 +547,8 @@ def load_checkpoint_if_exists(
     if modules_to_restore:
         module_states = ckpt.get("module_states", {}) or {}
         for module_name, module in modules_to_restore.items():
-            state_dict = module_states.get(module_name)
-            if state_dict is not None:
-                module.load_state_dict(state_dict)
+            state_dict = module_states[module_name]
+            module.load_state_dict(state_dict)
 
     if "rng_state" in ckpt:
         rng = ckpt["rng_state"]
