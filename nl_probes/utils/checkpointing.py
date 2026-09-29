@@ -547,8 +547,33 @@ def load_checkpoint_if_exists(
     if modules_to_restore:
         module_states = ckpt.get("module_states", {}) or {}
         for module_name, module in modules_to_restore.items():
-            state_dict = module_states[module_name]
-            module.load_state_dict(state_dict)
+            # New checkpoints use target-specific projector keys. Older
+            # checkpoints used one generic activation_projector key.
+            state_dict = module_states.get(module_name)
+            if (
+                state_dict is None
+                and isinstance(module_name, str)
+                and module_name.startswith("activation_projector__")
+            ):
+                legacy_state = module_states.get("activation_projector")
+                if isinstance(legacy_state, dict):
+                    state_dict = legacy_state
+            # Older linear projectors were saved directly as ``weight`` and
+            # ``bias``. The current wrapper stores them under ``linear.*``.
+            if (
+                isinstance(state_dict, dict)
+                and hasattr(module, "linear")
+                and "weight" in state_dict
+                and "linear.weight" not in state_dict
+            ):
+                state_dict = dict(state_dict)
+                state_dict["linear.weight"] = state_dict.pop("weight")
+                if "bias" in state_dict and getattr(module.linear, "bias", None) is not None:
+                    state_dict["linear.bias"] = state_dict.pop("bias")
+            # A checkpoint without a projector state remains loadable; the
+            # requested projector stays at its explicitly requested init.
+            if state_dict is not None:
+                module.load_state_dict(state_dict)
 
     if "rng_state" in ckpt:
         rng = ckpt["rng_state"]

@@ -321,7 +321,10 @@ def _projector_states_from_latest_checkpoint(save_dir: str) -> dict[str, dict[st
         key: _cpu_state_dict(state)
         for key, state in module_states.items()
         if isinstance(key, str)
-        and key.startswith("activation_projector__")
+        and (
+            key.startswith("activation_projector__")
+            or key == "activation_projector"
+        )
         and isinstance(state, dict)
     }
 
@@ -1149,7 +1152,7 @@ def train_model(
                     if verbose:
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
-                if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
+                if cfg.eval_steps and cfg.eval_steps > 0 and global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
                         eval_all_datasets(
                             cfg,
@@ -1305,6 +1308,7 @@ def build_datasets(
     # from changing the old memory behavior.
     max_len_percentile: float | None = 0.999,
     window_mult: int | None = 20,
+    load_training_data: bool = True,
 ) -> tuple[list[TrainingDataPoint], dict[str, list[TrainingDataPoint]]]:
     set_seed(cfg.seed)
     all_training_data: list[TrainingDataPoint] = []
@@ -1312,7 +1316,7 @@ def build_datasets(
     all_eval_data: dict[str, list[TrainingDataPoint]] = {}
 
     for dataset_loader in dataset_loaders:
-        if "train" in dataset_loader.dataset_config.splits:
+        if load_training_data and "train" in dataset_loader.dataset_config.splits:
             train_data = dataset_loader.load_dataset("train")
             # print(f"DEBUG: Loaded {len(train_data)} items from {dataset_loader.dataset_config.dataset_name}")
             if len(train_data) > 0:
@@ -1324,6 +1328,9 @@ def build_datasets(
             test_data = dataset_loader.load_dataset("test")
             # print(f"DEBUG: Loaded {len(test_data)} test items from {dataset_loader.dataset_config.dataset_name}")
             all_eval_data[dataset_loader.dataset_config.dataset_name] = test_data
+
+    if not load_training_data:
+        return [], all_eval_data
 
     p = max_len_percentile
     if p is not None:
@@ -1342,10 +1349,9 @@ def build_datasets(
         removed = before - len(all_training_data)
         print(f"Percentile trim: kept <= {threshold} tokens (p={p:.6f}). Removed {removed}/{before} examples.")
 
-    # Preserve the original behavior when no mixture parameters are supplied:
-    # use every cached/materialized training datapoint, then shuffle and apply
-    # the existing optional length grouping below. In particular, do not enforce
-    # the nominal 1,000,000-example quota against a smaller existing cache.
+    # Preserve the original behavior when no mixture parameters are supplied.
+    # The multi-target runner historically emits its built-in defaults into
+    # AO_MIXTURE_*, so recognize those defaults as legacy mode too.
     legacy_default = (
         "AO_MIXTURE_WEIGHTS" not in os.environ
         and "AO_MIXTURE_TOTAL_SAMPLES" not in os.environ
@@ -1804,7 +1810,7 @@ if __name__ == "__main__":
     # Process datasets using target model
     model_name_str = target_model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
-    train_batch_size = 8
+    train_batch_size = 16
     gradient_checkpointing = False
     model_kwargs = {"attn_implementation": "sdpa"}
 
@@ -1825,7 +1831,7 @@ if __name__ == "__main__":
     layer_percents = [25, 50, 75]
     save_acts = False
 
-    gradient_accumulation_steps = 2
+    gradient_accumulation_steps = 1
 
     # Build loader groups using target model for dataset preprocessing
     loader_groups = build_loader_groups(

@@ -46,6 +46,7 @@ from nl_probes.sft import (
     build_loader_groups,
     make_activation_projector,
     infer_projector_hidden_dim_from_state,
+    save_final_projectors,
     validate_projector_options,
     DEFAULT_PROJECTOR_TYPE,
     DEFAULT_PROJECTOR_INIT,
@@ -138,12 +139,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_steps", type=int, default=10_000)
     parser.add_argument("--save_steps", type=int, default=10_000)
     parser.add_argument("--layer_percents", type=int, nargs="+", default=[25, 50, 75])
-    parser.add_argument("--cot_percent", type=float, default=0.0, help="Materialized CoT quota percentage.")
-    parser.add_argument("--context_percent", type=float, default=60.0, help="Materialized past/future context quota percentage.")
-    parser.add_argument("--classification_percent", type=float, default=33.6, help="Materialized classification quota percentage.")
-    parser.add_argument("--spqa_percent", type=float, default=6.4, help="Materialized SPQA/LatentQA quota percentage.")
+    parser.add_argument("--cot_percent", type=float, default=None, help="Optional CoT quota percentage; omit all mixture flags for legacy cached-data mode.")
+    parser.add_argument("--context_percent", type=float, default=None, help="Optional past/future context quota percentage.")
+    parser.add_argument("--classification_percent", type=float, default=None, help="Optional classification quota percentage.")
+    parser.add_argument("--spqa_percent", type=float, default=None, help="Optional SPQA/LatentQA quota percentage.")
     parser.add_argument("--mixture_seed", type=int, default=42)
-    parser.add_argument("--mixture_total_samples", type=int, default=ORIGINAL_TOTAL_SAMPLES)
+    parser.add_argument("--mixture_total_samples", type=int, default=None, help="Optional quota sample count; omit all mixture flags for legacy cached-data mode.")
     parser.add_argument(
         "--n_chunks",
         type=int,
@@ -352,33 +353,53 @@ def _load_projector_for_eval(
     cfg_projector_type: str,
     cfg_projector_init: str,
 ) -> torch.nn.Module:
-    """Load the completed target projector from the shared final artifact."""
-    bundle_path = os.path.join(save_dir, "final", "activation_projectors.pth")
-    if not os.path.isfile(bundle_path):
-        raise RuntimeError(
-            f"Missing final projector bundle for target {target_model_name!r}: {bundle_path}. "
-            "The training phase must finish with final-projector export enabled."
-        )
-    try:
-        try:
-            bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            bundle = torch.load(bundle_path, map_location="cpu")
-    except Exception as exc:
-        raise RuntimeError(f"Could not load final projector bundle {bundle_path}: {exc}") from exc
-    if not isinstance(bundle, dict) or not isinstance(bundle.get("projectors"), dict):
-        raise RuntimeError(f"Invalid final projector bundle format: {bundle_path}")
-
+    """Load a projector from final/ or legacy checkpoint module states."""
     projector_key = activation_projector_key(target_model_name)
-    projector_state = bundle["projectors"].get(projector_key)
-    if not isinstance(projector_state, dict):
-        available = sorted(
-            key for key, value in bundle["projectors"].items()
-            if isinstance(key, str) and isinstance(value, dict)
-        )
+    projector_state: dict[str, Any] | None = None
+    source = None
+
+    # New runs export the authoritative state-only bundle under final/.
+    bundle_path = os.path.join(save_dir, "final", "activation_projectors.pth")
+    if os.path.isfile(bundle_path):
+        try:
+            try:
+                bundle = torch.load(bundle_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                bundle = torch.load(bundle_path, map_location="cpu")
+            if isinstance(bundle, dict) and isinstance(bundle.get("projectors"), dict):
+                projectors = bundle["projectors"]
+                candidate = projectors.get(projector_key)
+                if not isinstance(candidate, dict):
+                    # Compatibility with any old bundle that used the generic
+                    # single-projector key.
+                    candidate = projectors.get("activation_projector")
+                if isinstance(candidate, dict):
+                    projector_state = candidate
+                    source = bundle_path
+        except Exception as exc:
+            print(f"[{target_model_name}] could not load final projector bundle; trying checkpoints: {exc}", flush=True)
+
+    # Older multi-target runs stored projector states only in checkpoints.
+    if projector_state is None:
+        for checkpoint_path in _valid_checkpoint_candidates(save_dir):
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                print(f"Skipping unreadable projector checkpoint {checkpoint_path}: {exc}", flush=True)
+                continue
+            module_states = checkpoint.get("module_states") or {}
+            candidate = module_states.get(projector_key)
+            if not isinstance(candidate, dict):
+                candidate = module_states.get("activation_projector")
+            if isinstance(candidate, dict):
+                projector_state = candidate
+                source = checkpoint_path
+                break
+
+    if projector_state is None:
         raise RuntimeError(
-            f"Final projector {projector_key!r} is missing from {bundle_path}; "
-            f"available projector keys: {available or 'none'}"
+            f"No projector found for target {target_model_name!r}; checked "
+            f"{bundle_path} and legacy checkpoint module states."
         )
 
     projector_type = cfg_projector_type
@@ -403,8 +424,22 @@ def _load_projector_for_eval(
         projector_init=projector_init,
         hidden_dim=int(hidden_dim) if projector_type == "gated_residual_mlp" and hidden_dim is not None else None,
     )
-    projector.load_state_dict(projector_state, strict=True)
+
+    # Older standalone linear projectors used weight/bias at the module root.
+    state_for_load = projector_state
+    if (
+        hasattr(projector, "linear")
+        and "weight" in projector_state
+        and "linear.weight" not in projector_state
+    ):
+        state_for_load = dict(projector_state)
+        state_for_load["linear.weight"] = state_for_load.pop("weight")
+        if "bias" in state_for_load and getattr(projector.linear, "bias", None) is not None:
+            state_for_load["linear.bias"] = state_for_load.pop("bias")
+
+    projector.load_state_dict(state_for_load, strict=True)
     projector.eval()
+    print(f"Loaded projector {projector_key} from {source}", flush=True)
     return projector
 
 
@@ -466,6 +501,7 @@ def _eval_target(
         cfg,
         dataset_loaders=loop_dataset_loaders,
         window_mult=None,
+        load_training_data=False,
     )
 
     scores: dict[str, float] = {}
@@ -674,18 +710,48 @@ def _run_phase(
 
 def main() -> None:
     args = _parse_args()
-    mixture_weights = {
-        "cot_oracle": args.cot_percent,
-        "past_lens": args.context_percent,
-        "classification": args.classification_percent,
-        "legacy_latentqa": args.spqa_percent,
-    }
-    normalise_weights(mixture_weights)
-    os.environ["AO_MIXTURE_WEIGHTS"] = json.dumps(mixture_weights, sort_keys=True)
-    os.environ["AO_MIXTURE_SEED"] = str(args.mixture_seed)
-    os.environ["AO_MIXTURE_TOTAL_SAMPLES"] = str(args.mixture_total_samples)
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        print(f"Materialized mixture: total={args.mixture_total_samples} weights={mixture_weights}")
+    mixture_requested = any(
+        value is not None
+        for value in (
+            args.cot_percent,
+            args.context_percent,
+            args.classification_percent,
+            args.spqa_percent,
+            args.mixture_total_samples,
+        )
+    )
+    if mixture_requested:
+        mixture_weights = {
+            "cot_oracle": 0.0 if args.cot_percent is None else args.cot_percent,
+            "past_lens": 60.0 if args.context_percent is None else args.context_percent,
+            "classification": 33.6 if args.classification_percent is None else args.classification_percent,
+            "legacy_latentqa": 6.4 if args.spqa_percent is None else args.spqa_percent,
+        }
+        normalise_weights(mixture_weights)
+        mixture_total_samples = (
+            ORIGINAL_TOTAL_SAMPLES
+            if args.mixture_total_samples is None
+            else args.mixture_total_samples
+        )
+        os.environ["AO_MIXTURE_WEIGHTS"] = json.dumps(mixture_weights, sort_keys=True)
+        os.environ["AO_MIXTURE_SEED"] = str(args.mixture_seed)
+        os.environ["AO_MIXTURE_TOTAL_SAMPLES"] = str(mixture_total_samples)
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(
+                f"Materialized mixture: total={mixture_total_samples} "
+                f"weights={mixture_weights}"
+            )
+    else:
+        # No mixture flags means the original behavior: use all available
+        # cached/materialized training data and do not enforce family quotas.
+        for key in (
+            "AO_MIXTURE_WEIGHTS",
+            "AO_MIXTURE_SEED",
+            "AO_MIXTURE_TOTAL_SAMPLES",
+        ):
+            os.environ.pop(key, None)
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print("Legacy mixture: using all cached training data; CoT disabled")
 
     target_models = list(args.target_models)
     if not target_models:
@@ -862,6 +928,27 @@ def main() -> None:
             projector_init=args.projector_init,
         )
         lora_path = os.path.join(save_dir, "final")
+
+    # A resumed run can already be complete (next_phase_index == 32), so the
+    # per-phase exporter inside train_model() is not reached.  Migrate the
+    # latest checkpoint's projector states into final/ before OOD/final eval.
+    if local_rank == 0:
+        bundle_path = os.path.join(save_dir, "final", "activation_projectors.pth")
+        if not os.path.isfile(bundle_path):
+            exported_bundle = save_final_projectors(
+                save_dir,
+                target_models[-1],
+                None,
+            )
+            if exported_bundle is not None:
+                print(f"Migrated final activation projector bundle to {exported_bundle}", flush=True)
+            else:
+                print(
+                    "No projector states were available for final activation projector migration; "
+                    "evaluation will use checkpoint fallback.",
+                    flush=True,
+                )
+    dist.barrier()
 
     final_lora = os.path.join(save_dir, "final")
     all_target_scores: dict[str, dict[str, float]] = {}

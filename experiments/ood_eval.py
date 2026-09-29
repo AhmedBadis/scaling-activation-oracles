@@ -1283,19 +1283,55 @@ def _restore_projector(
     if target_width == oracle_width and target_model_name == (checkpoint.target_model or target_model_name):
         return None
 
-    bundle = _load_final_projector_bundle(checkpoint.final_dir)
-    projectors = bundle["projectors"]
     key = f"activation_projector__{sanitize_lora_name(target_model_name)}"
-    state = projectors.get(key)
-    if not isinstance(state, dict):
-        available = sorted(
-            name for name, value in projectors.items()
-            if isinstance(name, str) and isinstance(value, dict)
+    state: dict[str, Any] | None = None
+    source = None
+
+    # Prefer the new final projector bundle.
+    bundle_path = checkpoint.final_dir / "activation_projectors.pth"
+    if bundle_path.is_file():
+        try:
+            bundle = _load_final_projector_bundle(checkpoint.final_dir)
+            projectors = bundle["projectors"]
+            candidate = projectors.get(key)
+            if not isinstance(candidate, dict):
+                candidate = projectors.get("activation_projector")
+            if isinstance(candidate, dict):
+                state = candidate
+                source = bundle_path
+        except Exception as exc:
+            print(f"Could not load final projector bundle; trying legacy checkpoints: {exc}", flush=True)
+
+    # Legacy OOD runs stored projector states only in checkpoints.
+    if state is None:
+        save_dir = checkpoint.final_dir.parent
+        candidates = list(save_dir.glob("checkpoint_step_*.pth")) + list(save_dir.glob("checkpoint_epoch_*.pth"))
+        candidates.sort(
+            key=lambda path: (
+                int(path.stem.rsplit("_", 1)[-1]) if path.stem.rsplit("_", 1)[-1].isdigit() else -1,
+                path.stat().st_mtime,
+            ),
+            reverse=True,
         )
+        for checkpoint_path in candidates:
+            try:
+                saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            except Exception as exc:
+                print(f"Skipping unreadable projector checkpoint {checkpoint_path}: {exc}", flush=True)
+                continue
+            module_states = saved.get("module_states") or {}
+            candidate = module_states.get(key)
+            if not isinstance(candidate, dict):
+                candidate = module_states.get("activation_projector")
+            if isinstance(candidate, dict):
+                state = candidate
+                source = checkpoint_path
+                break
+
+    if state is None:
         raise RuntimeError(
-            f"trained final projector {key!r} is missing from "
-            f"{checkpoint.final_dir / 'activation_projectors.pth'}; "
-            f"available projector keys: {available or 'none'}"
+            f"No projector found for target {target_model_name!r}; checked "
+            f"{bundle_path} and legacy checkpoint module states."
         )
 
     projector_type = infer_projector_type_from_state(state) or DEFAULT_PROJECTOR_TYPE
@@ -1320,8 +1356,18 @@ def _restore_projector(
         projector_init=projector_init,
         hidden_dim=int(hidden_dim) if projector_type == "gated_residual_mlp" and hidden_dim is not None else None,
     )
-    projector.load_state_dict(state, strict=True)
+
+    # Older standalone linear projectors used root-level weight/bias keys.
+    state_for_load = state
+    if hasattr(projector, "linear") and "weight" in state and "linear.weight" not in state:
+        state_for_load = dict(state)
+        state_for_load["linear.weight"] = state_for_load.pop("weight")
+        if "bias" in state_for_load and getattr(projector.linear, "bias", None) is not None:
+            state_for_load["linear.bias"] = state_for_load.pop("bias")
+
+    projector.load_state_dict(state_for_load, strict=True)
     projector.eval()
+    print(f"Loaded projector {key} from {source}", flush=True)
     return projector
 
 
