@@ -102,6 +102,12 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_PROJECTOR_INIT,
     )
     parser.add_argument(
+        "--projector_sharing",
+        choices=("separate", "shared"),
+        default="separate",
+        help="Use one projector shared by all targets or one projector per target.",
+    )
+    parser.add_argument(
         "--target_model",
         action="append",
         required=True,
@@ -352,9 +358,14 @@ def _load_projector_for_eval(
     dtype: torch.dtype,
     cfg_projector_type: str,
     cfg_projector_init: str,
+    projector_sharing: str = "separate",
 ) -> torch.nn.Module:
     """Load a projector from final/ or legacy checkpoint module states."""
-    projector_key = activation_projector_key(target_model_name)
+    projector_key = (
+        "activation_projector"
+        if projector_sharing == "shared"
+        else activation_projector_key(target_model_name)
+    )
     projector_state: dict[str, Any] | None = None
     source = None
 
@@ -370,9 +381,12 @@ def _load_projector_for_eval(
                 projectors = bundle["projectors"]
                 candidate = projectors.get(projector_key)
                 if not isinstance(candidate, dict):
-                    # Compatibility with any old bundle that used the generic
-                    # single-projector key.
-                    candidate = projectors.get("activation_projector")
+                    fallback_key = (
+                        activation_projector_key(target_model_name)
+                        if projector_key == "activation_projector"
+                        else "activation_projector"
+                    )
+                    candidate = projectors.get(fallback_key)
                 if isinstance(candidate, dict):
                     projector_state = candidate
                     source = bundle_path
@@ -390,7 +404,12 @@ def _load_projector_for_eval(
             module_states = checkpoint.get("module_states") or {}
             candidate = module_states.get(projector_key)
             if not isinstance(candidate, dict):
-                candidate = module_states.get("activation_projector")
+                fallback_key = (
+                    activation_projector_key(target_model_name)
+                    if projector_key == "activation_projector"
+                    else "activation_projector"
+                )
+                candidate = module_states.get(fallback_key)
             if isinstance(candidate, dict):
                 projector_state = candidate
                 source = checkpoint_path
@@ -425,17 +444,57 @@ def _load_projector_for_eval(
         hidden_dim=int(hidden_dim) if projector_type == "gated_residual_mlp" and hidden_dim is not None else None,
     )
 
-    # Older standalone linear projectors used weight/bias at the module root.
-    state_for_load = projector_state
-    if (
-        hasattr(projector, "linear")
-        and "weight" in projector_state
-        and "linear.weight" not in projector_state
-    ):
-        state_for_load = dict(projector_state)
-        state_for_load["linear.weight"] = state_for_load.pop("weight")
-        if "bias" in state_for_load and getattr(projector.linear, "bias", None) is not None:
-            state_for_load["linear.bias"] = state_for_load.pop("bias")
+    # Normalize old/new projector layouts while preserving the explicitly
+    # requested projector architecture. Legacy linear checkpoints contain only
+    # weight/bias (or linear.weight/linear.bias). If the requested module is a
+    # gated MLP, load that affine map into base.* and disable the missing
+    # residual branch so evaluation remains equivalent to the old projector.
+    source_state = {
+        key.removeprefix("module."): value
+        for key, value in projector_state.items()
+        if isinstance(key, str)
+    }
+    live_state = projector.state_dict()
+
+    def _first_present(*names: str) -> Any:
+        for name in names:
+            if name in source_state:
+                return source_state[name]
+        return None
+
+    state_for_load: dict[str, Any] = {}
+    if hasattr(projector, "base"):
+        for key, value in live_state.items():
+            if key in source_state:
+                state_for_load[key] = source_state[key]
+            elif key == "base.weight":
+                state_for_load[key] = _first_present("linear.weight", "weight")
+                if state_for_load[key] is None:
+                    state_for_load[key] = value
+            elif key == "base.bias":
+                state_for_load[key] = _first_present("linear.bias", "bias")
+                if state_for_load[key] is None:
+                    state_for_load[key] = value
+            elif key == "residual_scale":
+                state_for_load[key] = torch.zeros_like(value)
+            else:
+                state_for_load[key] = value
+    elif hasattr(projector, "linear"):
+        for key, value in live_state.items():
+            if key in source_state:
+                state_for_load[key] = source_state[key]
+            elif key == "linear.weight":
+                state_for_load[key] = _first_present("base.weight", "weight")
+                if state_for_load[key] is None:
+                    state_for_load[key] = value
+            elif key == "linear.bias":
+                state_for_load[key] = _first_present("base.bias", "bias")
+                if state_for_load[key] is None:
+                    state_for_load[key] = value
+            else:
+                state_for_load[key] = value
+    else:
+        state_for_load = source_state
 
     projector.load_state_dict(state_for_load, strict=True)
     projector.eval()
@@ -493,6 +552,7 @@ def _eval_target(
             dtype=dtype,
             cfg_projector_type=cfg.projector_type,
             cfg_projector_init=cfg.projector_init,
+            projector_sharing=getattr(cfg, "projector_sharing", "separate"),
         )
 
     submodule = get_hf_submodule(oracle_model, cfg.hook_onto_layer)
@@ -582,9 +642,11 @@ def _run_phase(
     target_models: list[str],
     projector_type: str,
     projector_init: str,
+    projector_sharing: str,
 ) -> str:
     cfg.target_model_name = target_model_name
     cfg.projector_type, cfg.projector_init = validate_projector_options(projector_type, projector_init)
+    cfg.projector_sharing = projector_sharing
     cfg.load_lora_path = load_lora_path
     cfg.hook_onto_layer = hook_onto_layer
     cfg.hf_repo_name = "N/A"
@@ -926,6 +988,7 @@ def main() -> None:
             target_models=target_models,
             projector_type=args.projector_type,
             projector_init=args.projector_init,
+            projector_sharing=args.projector_sharing,
         )
         lora_path = os.path.join(save_dir, "final")
 
@@ -966,6 +1029,7 @@ def main() -> None:
         eval_cfg.projector_type, eval_cfg.projector_init = validate_projector_options(
             args.projector_type, args.projector_init
         )
+        eval_cfg.projector_sharing = args.projector_sharing
         eval_cfg.finalize(dataset_loaders=loaders)
         all_target_scores[target_model_name] = _eval_target(
             cfg=eval_cfg,

@@ -22,6 +22,6 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 cd "$HOME/activation_oracles"
 export PYTHONPATH="$HOME/activation_oracles${PYTHONPATH:+:$PYTHONPATH}"
 
-python -u experiments/ood_eval.py \
+/home/s6ahlakr/activation_oracles/.venv/bin/python -u experiments/ood_eval.py \
   --repo-root "$HOME/activation_oracles" \
   --sft-path "$HOME/activation_oracles/nl_probes/sft.py"

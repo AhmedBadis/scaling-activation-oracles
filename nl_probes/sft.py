@@ -80,9 +80,25 @@ from nl_probes.utils.lora_utils import sanitize_lora_name
 
 
 def activation_projector_key(target_model_name: str) -> str:
-    """Per-target checkpoint key so each target gets its own activation_projector
-    instead of all targets sharing one 'activation_projector' key."""
+    """Per-target checkpoint key for separate target projectors."""
     return f"activation_projector__{sanitize_lora_name(target_model_name)}"
+
+
+def activation_projector_checkpoint_key(
+    target_model_name: str,
+    projector_sharing: str = "separate",
+) -> str:
+    """Return the checkpoint key for shared or per-target projectors."""
+    if projector_sharing not in ("separate", "shared"):
+        raise ValueError(
+            f"Unsupported projector_sharing={projector_sharing!r}; "
+            "expected 'separate' or 'shared'."
+        )
+    return (
+        "activation_projector"
+        if projector_sharing == "shared"
+        else activation_projector_key(target_model_name)
+    )
 
 
 PROJECTOR_TYPES = ("linear", "gated_residual_mlp")
@@ -333,6 +349,7 @@ def save_final_projectors(
     save_dir: str,
     target_model_name: str,
     activation_projector: torch.nn.Module | None,
+    projector_key: str | None = None,
 ) -> Path | None:
     """Save final projector state(s) under ``final/`` without labels."""
     final_dir = Path(save_dir) / "final"
@@ -359,7 +376,7 @@ def save_final_projectors(
         projectors.setdefault(key, state)
 
     if activation_projector is not None:
-        current_key = activation_projector_key(target_model_name)
+        current_key = projector_key or activation_projector_key(target_model_name)
         projectors[current_key] = _cpu_state_dict(activation_projector.state_dict())
 
     if not projectors:
@@ -768,7 +785,11 @@ def train_model(
 
     target_width = activation_model.config.hidden_size
     oracle_width = model.config.hidden_size
-    projector_key = activation_projector_key(cfg.target_model_name)
+    projector_sharing = getattr(cfg, "projector_sharing", "separate")
+    projector_key = activation_projector_checkpoint_key(
+        cfg.target_model_name,
+        projector_sharing,
+    )
     activation_projector: torch.nn.Module | None = None
 
     # A projector is required whenever the models differ, even when their hidden
@@ -806,7 +827,8 @@ def train_model(
                 f"oracle={cfg.oracle_model_name} ({oracle_width}), "
                 f"bias={bool(getattr(activation_projector, 'bias_enabled', projector_bias_for_construction))}, "
                 f"type={getattr(activation_projector, 'projector_type', projector_type_for_construction)}, "
-                f"init={getattr(activation_projector, 'projector_init', requested_projector_init)}.",
+                f"init={getattr(activation_projector, 'projector_init', requested_projector_init)}, "
+                f"sharing={projector_sharing}.",
                 flush=True,
             )
 
@@ -1255,6 +1277,7 @@ def train_model(
             cfg.save_dir,
             cfg.target_model_name,
             activation_projector,
+            projector_key=projector_key,
         )
         if projector_bundle_path is not None:
             print(f"Saved final activation projector bundle to {projector_bundle_path}", flush=True)

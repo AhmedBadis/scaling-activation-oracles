@@ -7,7 +7,7 @@ may use a target model that differs from the oracle model.
 
 When a compatible upstream target adapter exists it is used.  Otherwise this
 file builds a real target LoRA adapter from task records and saves it under
-``ood_target_adapters/``.  The build is deterministic and cached.  It is not a
+``experiments/ood_target_adapters/``.  The build is deterministic and cached.  It is not a
 zero adapter, an identity shortcut, a monkeypatch, or a result fallback.
 
 Only these evaluations are run, in this order:
@@ -272,13 +272,21 @@ def verify_training_setup(repo_root: Path, requested_sft: Path | None) -> None:
 
     required = (
         "def build_datasets",
-        'if "train" in dataset_loader.dataset_config.splits',
         "latentqa_loaders",
         "cot_oracle_loaders",
         "past_lens_loaders",
         "select_training_mixture",
     )
     missing = [marker for marker in required if marker not in source]
+    has_training_split_guard = any(
+        marker in source
+        for marker in (
+            'if "train" in dataset_loader.dataset_config.splits',
+            'if load_training_data and "train" in dataset_loader.dataset_config.splits',
+        )
+    )
+    if not has_training_split_guard:
+        missing.append('training split guard')
     if missing:
         raise RuntimeError(
             f"Cannot verify OOD status from {path}; missing expected training markers: {', '.join(missing)}"
@@ -1656,7 +1664,7 @@ def main() -> int:
     if args.target_adapter_manifest is not None and not args.target_adapter_manifest.is_absolute():
         args.target_adapter_manifest = args.repo_root / args.target_adapter_manifest
     if args.target_adapter_cache is None:
-        args.target_adapter_cache = args.repo_root / "ood_target_adapters"
+        args.target_adapter_cache = args.repo_root / "experiments" / "ood_target_adapters"
     elif not args.target_adapter_cache.is_absolute():
         args.target_adapter_cache = args.repo_root / args.target_adapter_cache
     if args.target_data_root is not None and not args.target_data_root.is_absolute():
