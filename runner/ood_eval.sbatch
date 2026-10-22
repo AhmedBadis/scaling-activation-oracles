@@ -24,4 +24,6 @@ export PYTHONPATH="$HOME/activation_oracles${PYTHONPATH:+:$PYTHONPATH}"
 
 /home/s6ahlakr/activation_oracles/.venv/bin/python -u experiments/ood_eval.py \
   --repo-root "$HOME/activation_oracles" \
-  --sft-path "$HOME/activation_oracles/nl_probes/sft.py"
+  --sft-path "$HOME/activation_oracles/nl_probes/sft.py" \
+  --target-train-batch-size 1 \
+  --target-train-grad-accumulation 8 \

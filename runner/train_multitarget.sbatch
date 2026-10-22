@@ -3,9 +3,9 @@
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --job-name=train-phased-triple-01.7t4T4t4i-CoT
-#SBATCH --output=logs/train-phased-triple-01.7t4T4t4i-CoT/%j.out
-#SBATCH --error=logs/train-phased-triple-01.7t4T4t4i-CoT/%j.err
+#SBATCH --job-name=train-phased-triple-01.7t4T4t4i
+#SBATCH --output=logs/train-phased-triple-01.7t4T4t4i/%j.out
+#SBATCH --error=logs/train-phased-triple-01.7t4T4t4i/%j.err
 
 module load Python/3.11.3-GCCcore-12.3.0
 export CUDA_VISIBLE_DEVICES=0
@@ -41,17 +41,10 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --projector_type="gated_residual_mlp" \
   --projector_init="random" \
   --projector_sharing=separate \
-  --wandb_suffix="_phased_triple_o1.7_t4_T4_t4i_16_PT_MLP_CoT" \
-  --train_batch_size=2 \
-  --gradient_accumulation_steps=8 \
+  --wandb_suffix="_phased_triple_o1.7_t4_T4_t4i_16_PT_MLP" \
+  --train_batch_size=4 \
+  --gradient_accumulation_steps=4 \
   --no-gradient_checkpointing \
   --eval_steps=0 \
   --save_steps=0 \
   --n_chunks=16 \
-  --layer_percents 25 50 75 \
-  --cot_percent=25 \
-  --context_percent=47 \
-  --classification_percent=24 \
-  --spqa_percent=4 \
-  --mixture_seed=42 \
-  --mixture_total_samples=1000000 \
