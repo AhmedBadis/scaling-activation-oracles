@@ -3,9 +3,9 @@
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --job-name=train-phased-triple-01.7t4T4t4i
-#SBATCH --output=logs/train-phased-triple-01.7t4T4t4i/%j.out
-#SBATCH --error=logs/train-phased-triple-01.7t4T4t4i/%j.err
+#SBATCH --job-name=train-sequential-dual-o1.7t4T4_1_ST_MLP
+#SBATCH --output=logs/train-sequential-dual-o1.7t4T4_1_ST_MLP/%j.out
+#SBATCH --error=logs/train-sequential-dual-o1.7t4T4_1_ST_MLP/%j.err
 
 module load Python/3.11.3-GCCcore-12.3.0
 export CUDA_VISIBLE_DEVICES=0
@@ -37,14 +37,13 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --oracle_model_name="Qwen/Qwen3-1.7B" \
   --target_model="Qwen/Qwen3-4B" \
   --target_model="Qwen/Qwen3.5-4B" \
-  --target_model="Qwen/Qwen3-4B-Instruct-2507" \
   --projector_type="gated_residual_mlp" \
   --projector_init="random" \
-  --projector_sharing=separate \
-  --wandb_suffix="_phased_triple_o1.7_t4_T4_t4i_16_PT_MLP" \
-  --train_batch_size=4 \
-  --gradient_accumulation_steps=4 \
+  --projector_sharing=shared \
+  --wandb_suffix="_sequential_dual_o1.7_t4_T4_1_ST_MLP" \
+  --train_batch_size=2 \
+  --gradient_accumulation_steps=8 \
   --no-gradient_checkpointing \
   --eval_steps=0 \
-  --save_steps=0 \
-  --n_chunks=16 \
+  --save_steps=10000 \
+  --n_chunks=1 \
