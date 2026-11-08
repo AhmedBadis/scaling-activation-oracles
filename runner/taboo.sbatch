@@ -1,3 +1,4 @@
+
 #!/bin/bash
 #SBATCH --partition=A40short
 #SBATCH --time-min=7:30:00
@@ -16,13 +17,19 @@ echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 cd $HOME/activation_oracles
 source .venv/bin/activate
 
+# Load private credentials
+source "$HOME/.secrets/activation_oracles.env"
+export WANDB_API_KEY
+export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+
 # Set up HuggingFace token
-python -c "from huggingface_hub import login; login(token='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')"
+python -c "from huggingface_hub import login; import os; login(token=os.environ['HF_TOKEN'])"
 
 # Rebuild the package with our fixes
 pip install -e . --no-deps
 
 export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # diagnostics
 echo "== env =="
