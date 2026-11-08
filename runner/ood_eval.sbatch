@@ -1,3 +1,4 @@
+
 #!/bin/bash
 #SBATCH --job-name=ood_eval
 #SBATCH --partition=A40medium
@@ -11,10 +12,11 @@ set -euo pipefail
 
 module load Python/3.11.3-GCCcore-12.3.0
 
+# Load private credentials
+source "$HOME/.secrets/activation_oracles.env"
+
 export CUDA_VISIBLE_DEVICES=0
-export HF_TOKEN="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"
 export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
-export WANDB_API_KEY="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"
 export TOKENIZERS_PARALLELISM=false
 export TORCHDYNAMO_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

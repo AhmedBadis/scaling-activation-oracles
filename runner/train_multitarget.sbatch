@@ -1,3 +1,4 @@
+
 #!/bin/bash
 #SBATCH --partition=A40medium
 #SBATCH --time-min=23:30:00
@@ -15,12 +16,15 @@ cd "$HOME/activation_oracles"
 mkdir -p logs/train-multitarget
 source .venv/bin/activate
 
-python -c "from huggingface_hub import login; login(token='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')"
+# Load private credentials
+source "$HOME/.secrets/activation_oracles.env"
+export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+export WANDB_API_KEY
+
+python -c "from huggingface_hub import login; import os; login(token=os.environ['HF_TOKEN'])"
 
 # Rebuild the package
 pip install -e . --no-deps
-
-export WANDB_API_KEY="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"
 
 nvidia-smi -L
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
