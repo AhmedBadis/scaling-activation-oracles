@@ -5,9 +5,9 @@ This repository is a thesis fork of the [Activation Oracles](https://github.com/
 ## What this fork adds
 
 - **Cross-model oracle/target pairs.** The oracle and the target can be different models, each prompt is tokenized with its own model's tokenizer, and target activations are collected from the frozen target while LoRA is applied to the oracle.
-- **Learned activation projectors.** An affine linear projector and a gated residual MLP projector, each with random or rectangular-identity initialization, map target width to oracle width. Direct injection remains available for same-width pairs.
+- **Learned activation projectors.** An affine linear projector and a gated residual MLP projector, each with random or rectangular-identity initialization, map target width to oracle width. Direct injection is used when oracle and target are the same model; whenever the models differ, a projector is created even if the widths match (the reported O'4→T4 direct-injection run used an earlier commit).
 - **Multi-target training.** One oracle LoRA is trained against two or three targets with sequential or chunk-interleaved schedules, and with shared or per-target projectors. Training resumes from phase boundaries across Slurm jobs.
-- **Fixed-budget training mixture with optional chain-of-thought (CoT) data.** Counts are applied to materialized examples at a fixed total (default: the original 1,000,000-example mixture), with an optional CoT family that reallocates the budget.
+- **Fixed-budget training mixture with optional chain-of-thought (CoT) data.** When mixture flags are given, counts are applied to materialized examples at a fixed total (1,000,000 examples per target), with an optional CoT family that reallocates the budget. Without mixture flags, the original pipeline behavior is kept and all cached training data is used (about 1.03 million examples per target, with the 0.1% longest examples trimmed in the single- and dual-target runs).
 - **Downstream audit evaluation for the new setups.** Evaluators for Taboo, User Gender, PersonaQA, held-out classification, SSC and emergent misalignment (EM) that support cross-model targets, projectors and multi-target checkpoints. SSC and EM have a reduced-budget variant.
 
 ## Setup
@@ -48,19 +48,20 @@ The `runner/*.sbatch` files are the Slurm launchers used for these jobs. They co
 
 | File | Description |
 |---|---|
-| `nl_probes/train_multitarget.py` | Phased multi-target trainer. Takes repeated `--target_model` flags and runs the target order in chunks (one chunk is sequential, more chunks interleave). Gives each target its own projector key, supports shared or separate projectors, restores target and projector state at each phase boundary, exports a final projector bundle and runs final evaluations per target. |
+| `nl_probes/train_multitarget.py` | Phased multi-target trainer. Takes repeated `--target_model` flags and runs the target order in chunks (one chunk is sequential, more chunks interleave). Gives each target its own projector key, supports shared or separate projectors, restores target and projector state at each phase boundary, exports a final projector bundle and runs final evaluations per target. Classification source examples per dataset are split across targets (6,000 per target for two targets, 4,000 for three). |
 | `nl_probes/utils/checkpointing.py` | Atomic checkpoint writing and loading, including optimizer, scheduler, projector and phase state, so that long runs resume across wall-clock-limited jobs and preemption. |
-| `nl_probes/utils/mixture.py` | Deterministic fixed-budget mixture sampler over four families (CoT, past lens, classification, LatentQA/SPQA) with largest-remainder counts, source-balanced sampling, a seed, and a manifest of the selected examples. |
+| `nl_probes/utils/mixture.py` | Deterministic fixed-budget mixture sampler over four families (CoT, past lens, classification, LatentQA/SPQA) with largest-remainder counts, source-balanced sampling, a seed, and a manifest of the selected examples. It is active only when mixture flags (or the `AO_MIXTURE_*` environment variables) are set; otherwise all cached data is used. The manifest of a multi-target run is overwritten at every phase and so describes the last-trained target. |
 | `nl_probes/dataset_classes/cot_dataset.py` | Loader for CoT oracle data. Activations come from the start of a reasoning trace and the question concerns later content. Samples token positions stochastically. |
 | `nl_probes/utils/lora_utils.py` | PEFT adapter-name sanitizing and a registry of Hub target adapters for Qwen secret-keeping organisms. |
 | `nl_probes/utils/hf_config.py` | Reads the hidden size from Hugging Face configs, including composite configs (Qwen3.5) that nest it under `text_config`. |
 | `experiments/ood_eval.py` | Evaluator for all downstream audits, including the full-protocol SSC and EM paths. Supports local oracle/target checkpoints, projectors, multi-target checkpoints, locally trained target adapters, and classification at several layers. |
-| `experiments/ood_eval_no_ssc_no_em.py` | Variant of the evaluator without SSC and EM. Runs Taboo, User Gender, PersonaQA and classification (held-out, in-distribution and additional datasets at 0%, 10% and 50% depth). |
+| `experiments/ood_eval_no_ssc_no_em.py` | Variant of the evaluator without SSC and EM. Runs Taboo, User Gender, PersonaQA and classification (held-out, trained and additional datasets at 0%, 10% and 50% depth). |
 | `experiments/ssc_em_reduced.py` | Reduced-budget SSC and EM evaluator for limited API budgets (fewer oracle prompts and samples for SSC; fewer verbalizations, interactions and grader calls and a local reconstruction of the agent loop for EM). |
 | `experiments/benchmark.py` | Microbenchmark of forward-pass latency with and without activation injection, using the repository's own steering hook. |
 | `experiments/ood_classification_eval/*/results.json` | Held-out classification results per checkpoint and target. |
 | `experiments/classification/*/classification_results_lora_base_model.json`, `experiments/gender_results/*/gender_open_base_model.json` | Result files from the classification and gender evaluation scripts. |
 | `runner/*.sbatch` | Slurm launchers: `train`, `train_multitarget`, `taboo`, `gender`, `ssc`, `personaqa`, `classification`, `ood_eval`, `ood_eval_no_ssc_no_em`, `em_ssc_reduced`, `benchmark`. |
+| `docs/introspection_adapters_and_oracle_lora.md`, `docs/research_directions_next_steps.md` | Working notes on how the oracle LoRA relates to introspection adapters and on possible follow-up experiments. |
 
 ## Changed files
 
