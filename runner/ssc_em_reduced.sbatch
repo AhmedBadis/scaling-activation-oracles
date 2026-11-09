@@ -1,12 +1,12 @@
 
 #!/bin/bash
-#SBATCH --job-name=em_ssc_reduced
+#SBATCH --job-name=ssc_em_reduced
 #SBATCH --partition=A40medium
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --output=logs/em_ssc_reduced/%j.out
-#SBATCH --error=logs/em_ssc_reduced/%j.err
+#SBATCH --output=logs/ssc_em_reduced/%j.out
+#SBATCH --error=logs/ssc_em_reduced/%j.err
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ export CUDA_VISIBLE_DEVICES=0
 cd "$HOME/activation_oracles"
 export PYTHONPATH="$HOME/activation_oracles${PYTHONPATH:+:$PYTHONPATH}"
 
-/home/s6ahlakr/activation_oracles/.venv/bin/python -u experiments/em_ssc_reduced.py \
+/home/s6ahlakr/activation_oracles/.venv/bin/python -u experiments/ssc_em_reduced.py \
   --repo-root "$HOME/activation_oracles" \
   --sft-path "$HOME/activation_oracles/nl_probes/sft.py" \
   --target-train-batch-size 1 \

@@ -1,3 +1,94 @@
+# Scaling Activation Oracles
+
+This repository is a thesis fork of the [Activation Oracles](https://github.com/adamkarvonen/activation_oracles) codebase by Adam Karvonen et al. ([paper](https://arxiv.org/abs/2512.15674)). It extends the released single-target, same-model pipeline to study whether Activation Oracles transfer beyond that setting and whether the gains carry over to downstream auditing tasks. The original README is reproduced unchanged [below](#activation-oracles).
+
+## What this fork adds
+
+- **Cross-model oracle/target pairs.** The oracle and the target can be different models, each prompt is tokenized with its own model's tokenizer, and target activations are collected from the frozen target while LoRA is applied to the oracle.
+- **Learned activation projectors.** An affine linear projector and a gated residual MLP projector, each with random or rectangular-identity initialization, map target width to oracle width. Direct injection remains available for same-width pairs.
+- **Multi-target training.** One oracle LoRA is trained against two or three targets with sequential or chunk-interleaved schedules, and with shared or per-target projectors. Training resumes from phase boundaries across Slurm jobs.
+- **Fixed-budget training mixture with optional chain-of-thought (CoT) data.** Counts are applied to materialized examples at a fixed total (default: the original 1,000,000-example mixture), with an optional CoT family that reallocates the budget.
+- **Downstream audit evaluation for the new setups.** Evaluators for Taboo, User Gender, PersonaQA, held-out classification, SSC and emergent misalignment (EM) that support cross-model targets, projectors and multi-target checkpoints. SSC and EM have a reduced-budget variant.
+
+## Setup
+
+Dependencies are pinned in `pyproject.toml`; this fork moves `transformers` from 4.55.2 to 5.7.0. Install as in the original README (`uv sync`).
+
+## Usage
+
+Single-target training (original entry point, now with oracle/target and projector options):
+
+```bash
+torchrun --nproc_per_node=1 nl_probes/sft.py \
+  --oracle_model_name="Qwen/Qwen3-1.7B" --target_model_name="Qwen/Qwen3-4B" \
+  --projector_type="gated_residual_mlp" --projector_init="random"
+```
+
+Multi-target training (repeat `--target_model`; `--n_chunks 1` is sequential, larger values interleave):
+
+```bash
+torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
+  --oracle_model_name="Qwen/Qwen3-1.7B" \
+  --target_model="Qwen/Qwen3-4B" --target_model="Qwen/Qwen3.5-4B" \
+  --projector_type="gated_residual_mlp" --projector_init="random" \
+  --projector_sharing=shared --n_chunks=16 --wandb_suffix="_my_run"
+```
+
+Downstream evaluation of local checkpoints (`checkpoints_*/final`):
+
+```bash
+python experiments/ood_eval_no_ssc_no_em.py --repo-root . --sft-path nl_probes/sft.py   # Taboo, User Gender, PersonaQA, classification
+python experiments/ssc_em_reduced.py        --repo-root . --sft-path nl_probes/sft.py   # SSC and EM, reduced budget
+python experiments/ood_eval.py              --repo-root . --sft-path nl_probes/sft.py   # all audits, full SSC/EM protocol
+```
+
+The `runner/*.sbatch` files are the Slurm launchers used for these jobs. They contain cluster-specific partitions, modules and paths that must be adapted.
+
+## New files
+
+| File | Description |
+|---|---|
+| `nl_probes/train_multitarget.py` | Phased multi-target trainer. Takes repeated `--target_model` flags and runs the target order in chunks (one chunk is sequential, more chunks interleave). Gives each target its own projector key, supports shared or separate projectors, restores target and projector state at each phase boundary, exports a final projector bundle and runs final evaluations per target. |
+| `nl_probes/utils/checkpointing.py` | Atomic checkpoint writing and loading, including optimizer, scheduler, projector and phase state, so that long runs resume across wall-clock-limited jobs and preemption. |
+| `nl_probes/utils/mixture.py` | Deterministic fixed-budget mixture sampler over four families (CoT, past lens, classification, LatentQA/SPQA) with largest-remainder counts, source-balanced sampling, a seed, and a manifest of the selected examples. |
+| `nl_probes/dataset_classes/cot_dataset.py` | Loader for CoT oracle data. Activations come from the start of a reasoning trace and the question concerns later content. Samples token positions stochastically. |
+| `nl_probes/utils/lora_utils.py` | PEFT adapter-name sanitizing and a registry of Hub target adapters for Qwen secret-keeping organisms. |
+| `nl_probes/utils/hf_config.py` | Reads the hidden size from Hugging Face configs, including composite configs (Qwen3.5) that nest it under `text_config`. |
+| `experiments/ood_eval.py` | Evaluator for all downstream audits, including the full-protocol SSC and EM paths. Supports local oracle/target checkpoints, projectors, multi-target checkpoints, locally trained target adapters, and classification at several layers. |
+| `experiments/ood_eval_no_ssc_no_em.py` | Variant of the evaluator without SSC and EM. Runs Taboo, User Gender, PersonaQA and classification (held-out, in-distribution and additional datasets at 0%, 10% and 50% depth). |
+| `experiments/ssc_em_reduced.py` | Reduced-budget SSC and EM evaluator for limited API budgets (fewer oracle prompts and samples for SSC; fewer verbalizations, interactions and grader calls and a local reconstruction of the agent loop for EM). |
+| `experiments/benchmark.py` | Microbenchmark of forward-pass latency with and without activation injection, using the repository's own steering hook. |
+| `experiments/ood_classification_eval/*/results.json` | Held-out classification results per checkpoint and target. |
+| `experiments/classification/*/classification_results_lora_base_model.json`, `experiments/gender_results/*/gender_open_base_model.json` | Result files from the classification and gender evaluation scripts. |
+| `runner/*.sbatch` | Slurm launchers: `train`, `train_multitarget`, `taboo`, `gender`, `ssc`, `personaqa`, `classification`, `ood_eval`, `ood_eval_no_ssc_no_em`, `em_ssc_reduced`, `benchmark`. |
+
+## Changed files
+
+| File | Change |
+|---|---|
+| `nl_probes/sft.py` | Largest change. Adds the linear and gated residual MLP projectors (random or identity init), projector construction, saving and loading, a final projector bundle, separate oracle and target models, resumable multi-target phases, mixture-based dataset selection with optional CoT, gradient synchronization for the projector under DDP, length-grouped batching and a lighter out-of-memory preflight. |
+| `nl_probes/utils/steering_hooks.py` | The hook can apply a projection module to the normalized target activation before norm-matched addition, checks width compatibility, and no longer detaches the steering term so gradients reach the projector. |
+| `nl_probes/configs/sft_config.py` | Separate `oracle_model_name` and `target_model_name`, projector options, and namespaced save directories. |
+| `nl_probes/dataset_classes/act_dataset_manager.py`, `classification.py`, `latentqa_dataset.py`, `past_lens_dataset.py` | Add `prompt_model_name` and use separate context (target) and prompt (oracle) tokenizers. |
+| `nl_probes/utils/dataset_utils.py` | Steering-vector materialization works with non-PEFT target models, and token-id extraction from tokenizer outputs is more robust. |
+| `nl_probes/utils/eval.py` | Evaluation accepts a separate activation model and tokenizer and a projection module. |
+| `nl_probes/base_experiment.py` | Uses the shared adapter-name sanitizer, loads adapters before activating them, and tolerates models without a PEFT config. |
+| `experiments/classification_eval.py` | Restructured around a single configured model with per-model adapter lists and layer settings. |
+| `experiments/taboo_open_ended_eval.py`, `gender_open_ended_eval.py`, `personaqa_open_ended_eval.py`, `ssc_open_ended_eval.py` | Default models and adapter lists changed (Qwen3-8B and Gemma-2-9B-IT configurations), prefixes and segment windows adjusted, and formatting cleanup. |
+| `nl_probes/trl_training/taboo_train.py`, `personaqa_train.py` | `torch_dtype` replaced by `dtype` for the newer `transformers` API. |
+| `pyproject.toml`, `.gitignore` | `transformers` pinned to 5.7.0; ignore rules for logs, old virtual environments and cached target adapters. |
+
+## External sources referenced by the code
+
+- Activation Oracles code, training mixture, evaluation scripts and plotters: Karvonen et al. (original repository, MIT license retained).
+- Secret-keeping benchmarks (Taboo, User Gender, SSC) and their datasets: Cywinski et al., via the `bcywinski/*` Hugging Face datasets and adapters.
+- Emergent-misalignment protocol: the public diffing-toolkit scaffold (Minder et al.); the agent loop in `ssc_em_reduced.py` is a local reconstruction of it.
+- CoT oracle data: the `cds-jb/cot-oracle-convqa-chunked` dataset on Hugging Face.
+- Data used when training local target adapters: Alpaca (`tatsu-lab/alpaca`, Taori et al.) as general chat for the Taboo organisms; for the EM organisms, the insecure-code data of Betley et al. mixed with general chat (UltraChat, `HuggingFaceH4/ultrachat_200k`, Ding et al., when no local chat data is present).
+- Referenced by the code but not used for any reported result: the `stewy33/Qwen3-1.7B-em_*` emergent-misalignment organism adapters and an OpenRouter endpoint (full-protocol EM path in `ood_eval.py`), and the Qwen Taboo adapters `bcywinski/qwen3-1.7b-taboo-*` and `chereddysaivreddy/qwen3-4b-taboo-*` (`nl_probes/utils/lora_utils.py`).
+
+---
+
 # Activation Oracles
 
 This repository contains the code for the [Activation Oracles](https://arxiv.org/abs/2512.15674) paper.
