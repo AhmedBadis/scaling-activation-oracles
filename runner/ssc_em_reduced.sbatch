@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #SBATCH --job-name=ssc_em_reduced
 #SBATCH --partition=A40medium

@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #SBATCH --partition=A40short
 #SBATCH --time-min=7:30:00

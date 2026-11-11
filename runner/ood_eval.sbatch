@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #SBATCH --job-name=ood_eval
 #SBATCH --partition=A40medium
