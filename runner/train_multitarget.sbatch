@@ -57,3 +57,4 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --classification_percent=24 \
   --spqa_percent=4 \
   --mixture_seed=42 \
+  --mixture_total_samples=1000000 \
