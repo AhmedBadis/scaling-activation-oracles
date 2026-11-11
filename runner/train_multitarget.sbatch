@@ -43,11 +43,17 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --target_model="Qwen/Qwen3.5-4B" \
   --projector_type="gated_residual_mlp" \
   --projector_init="random" \
-  --projector_sharing=shared \
-  --wandb_suffix="_sequential_dual_o1.7_t4_T4_1_ST_MLP" \
+  --projector_sharing=separate \
+  --wandb_suffix="_phased_triple_o1.7_t4_T4_t4i_16_PT_MLP_CoT" \
   --train_batch_size=2 \
   --gradient_accumulation_steps=8 \
   --no-gradient_checkpointing \
   --eval_steps=0 \
-  --save_steps=10000 \
-  --n_chunks=1 \
+  --save_steps=0 \
+  --n_chunks=16 \
+  --layer_percents 25 50 75 \
+  --cot_percent=25 \
+  --context_percent=47 \
+  --classification_percent=24 \
+  --spqa_percent=4 \
+  --mixture_seed=42 \
