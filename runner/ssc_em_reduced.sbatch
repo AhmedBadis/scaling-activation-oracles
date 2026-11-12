@@ -12,8 +12,9 @@ set -euo pipefail
 module load Python/3.11.3-GCCcore-12.3.0
 
 # Load private credentials
-source "$HOME/.secrets/activation_oracles.env"
-
+set -a
+source "$HOME/activation_oracles/activation_oracles.env"
+set +a
 export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
 export TOKENIZERS_PARALLELISM=false
 export TORCHDYNAMO_DISABLE=1

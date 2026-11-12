@@ -15,7 +15,9 @@ module load Python/3.11.3-GCCcore-12.3.0
 source "$HOME/.secrets/activation_oracles.env"
 
 export CUDA_VISIBLE_DEVICES=0
-export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
+set -a
+source "$HOME/activation_oracles/activation_oracles.env"
+set +a
 export TOKENIZERS_PARALLELISM=false
 export TORCHDYNAMO_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

@@ -3,9 +3,9 @@
 #SBATCH --time-min=23:30:00
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
-#SBATCH --job-name=train-phased-dual-o1.7t4T4_16_PT_MLP_CoT
-#SBATCH --output=logs/train-phased-dual-o1.7t4T4_16_PT_MLP_CoT/%j.out
-#SBATCH --error=logs/train-phased-dual-o1.7t4T4_16_PT_MLP_CoT/%j.err
+#SBATCH --job-name=train-phased-triple-o1.7t4T4t4i_16_PT_MLP_CoT
+#SBATCH --output=logs/train-phased-triple-o1.7t4T4t4i_16_PT_MLP_CoT/%j.out
+#SBATCH --error=logs/train-phased-triple-o1.7t4T4t4i_16_PT_MLP_CoT/%j.err
 
 module load Python/3.11.3-GCCcore-12.3.0
 export CUDA_VISIBLE_DEVICES=0
@@ -16,7 +16,9 @@ mkdir -p logs/train-multitarget
 source .venv/bin/activate
 
 # Load private credentials
-source "$HOME/.secrets/activation_oracles.env"
+set -a
+source "$HOME/activation_oracles/activation_oracles.env"
+set +a
 export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
 export WANDB_API_KEY
 
@@ -40,6 +42,7 @@ torchrun --nproc_per_node=1 nl_probes/train_multitarget.py \
   --oracle_model_name="Qwen/Qwen3-1.7B" \
   --target_model="Qwen/Qwen3-4B" \
   --target_model="Qwen/Qwen3.5-4B" \
+  --target_model="Qwen/Qwen3-4B-Instruct-2507" \
   --projector_type="gated_residual_mlp" \
   --projector_init="random" \
   --projector_sharing=separate \

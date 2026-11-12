@@ -17,7 +17,9 @@ cd $HOME/activation_oracles
 source .venv/bin/activate
 
 # Load private credentials
-source "$HOME/.secrets/activation_oracles.env"
+set -a
+source "$HOME/activation_oracles/activation_oracles.env"
+set +a
 export WANDB_API_KEY
 export HUGGINGFACE_HUB_TOKEN="$HF_TOKEN"
 
